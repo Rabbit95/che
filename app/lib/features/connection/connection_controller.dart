@@ -148,8 +148,34 @@ class ConnectionController {
     required ConnectionLog initialLog,
     required String handshakeTag,
     required String handshakeCompleteMessage,
-  }) async* {
+  }) {
+    // Use a StreamController rather than `async*` so we can inject events
+    // that originate outside the linear handshake flow — specifically the
+    // ICC `openProgress` heartbeats that fire while `transport.open()` is
+    // awaiting `didOpenSessionWithError`. An async generator is suspended
+    // during `await` and can't yield in the meantime.
+    final controller = StreamController<ConnectionEvent>();
+    unawaited(_driveHandshake(
+      out: controller,
+      transportChannel: transportChannel,
+      config: config,
+      initialLog: initialLog,
+      handshakeTag: handshakeTag,
+      handshakeCompleteMessage: handshakeCompleteMessage,
+    ));
+    return controller.stream;
+  }
+
+  Future<void> _driveHandshake({
+    required StreamController<ConnectionEvent> out,
+    required TransportChannel transportChannel,
+    required TransportConfig config,
+    required ConnectionLog initialLog,
+    required String handshakeTag,
+    required String handshakeCompleteMessage,
+  }) async {
     final sw = Stopwatch()..start();
+    StreamSubscription<IccOpenProgress>? iccProgressSub;
 
     ConnectionLog log(
       String tag,
@@ -164,114 +190,166 @@ class ConnectionController {
           elapsedMs: timed ? sw.elapsedMilliseconds : null,
         );
 
-    yield initialLog;
-
-    final transport = _transportFactory(transportChannel);
-    _transport = transport;
+    void emit(ConnectionEvent e) {
+      if (!out.isClosed) out.add(e);
+    }
 
     try {
-      await transport.open(config);
-      if (_cancelled) return;
-      yield log(
-        handshakeTag,
-        handshakeCompleteMessage,
-        level: ConnectionLogLevel.ok,
-      );
+      emit(initialLog);
 
-      final session = PtpSession(transport: transport);
-      _session = session;
-      final client = NikonZClient(session);
+      final transport = _transportFactory(transportChannel);
+      _transport = transport;
 
-      yield log(
-        'CTRL',
-        'OpenSession + GetDeviceInfo…',
-        level: ConnectionLogLevel.active,
-        timed: false,
-      );
-
-      final info = await client.connect();
-      if (_cancelled) {
-        await client.disconnect(sendCloseSession: false);
-        return;
+      if (transport is IccTransport) {
+        iccProgressSub = transport.openProgress.listen((p) {
+          final text = _iccProgressText(p);
+          if (text == null) return;
+          emit(ConnectionLog(
+            tag: 'ICC',
+            text: text,
+            level: ConnectionLogLevel.info,
+            elapsedMs: sw.elapsedMilliseconds,
+          ));
+        });
       }
 
-      yield log(
-        'CTRL',
-        'ChangeApplicationMode(1) 完成',
-        level: ConnectionLogLevel.ok,
-      );
-      yield log(
-        'READY',
-        '${info.model} · SN ${info.serialNumber} · ${info.deviceVersion}',
-        level: ConnectionLogLevel.ok,
-      );
+      try {
+        await transport.open(config);
+        if (_cancelled) return;
+        emit(log(
+          handshakeTag,
+          handshakeCompleteMessage,
+          level: ConnectionLogLevel.ok,
+        ));
 
-      _handedOff = true;
-      yield ConnectionReady(
-        transport: transport,
-        session: session,
-        client: client,
-        deviceInfo: info,
-      );
-    } on PtpIpInitFailException catch (e) {
-      yield log(
-        'PTPIP',
-        'InitFail — 相机拒绝握手（reason 0x'
-            '${e.reasonCode.toRadixString(16).padLeft(4, '0').toUpperCase()}），'
-            '通常表示未在相机上完成配对',
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(message: '相机拒绝握手', cause: e);
-    } on PtpTimeoutException catch (e) {
-      yield log(
-        transportChannel == TransportChannel.usb ? 'USB' : 'TCP',
-        '连接超时 — 检查手机是否已连接到相机 Wi-Fi',
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(message: '连接超时', cause: e);
-    } on PtpResponseException catch (e) {
-      final opName = e.opcode == null
-          ? '(unknown)'
-          : _opcodeName(e.opcode!);
-      final hint = _hintForResponse(e.code);
-      yield log(
-        'CTRL',
-        '$opName 失败: ${e.codeLabel}${hint == null ? '' : ' — $hint'}',
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(
-        message: '$opName 失败: ${e.codeLabel}${hint == null ? '' : ' — $hint'}',
-        cause: e,
-      );
-    } on PtpTransportException catch (e) {
-      yield log(
-        transportChannel == TransportChannel.usb ? 'USB' : 'TCP',
-        e.message,
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(message: '传输层错误: ${e.message}', cause: e);
-    } on SocketException catch (e) {
-      yield log(
-        'TCP',
-        _friendlySocketError(e),
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(message: _friendlySocketError(e), cause: e);
-    } on TimeoutException catch (e) {
-      yield log(
-        'TCP',
-        '连接超时（8s） — 相机 IP 或网络可能不可达',
-        level: ConnectionLogLevel.error,
-      );
-      await _teardown();
-      yield ConnectionFailed(message: '连接超时', cause: e);
+        final session = PtpSession(transport: transport);
+        _session = session;
+        final client = NikonZClient(session);
+
+        emit(log(
+          'CTRL',
+          'OpenSession + GetDeviceInfo…',
+          level: ConnectionLogLevel.active,
+          timed: false,
+        ));
+
+        final info = await client.connect();
+        if (_cancelled) {
+          await client.disconnect(sendCloseSession: false);
+          return;
+        }
+
+        emit(log(
+          'CTRL',
+          'ChangeApplicationMode(1) 完成',
+          level: ConnectionLogLevel.ok,
+        ));
+        emit(log(
+          'READY',
+          '${info.model} · SN ${info.serialNumber} · ${info.deviceVersion}',
+          level: ConnectionLogLevel.ok,
+        ));
+
+        _handedOff = true;
+        emit(ConnectionReady(
+          transport: transport,
+          session: session,
+          client: client,
+          deviceInfo: info,
+        ));
+      } on PtpIpInitFailException catch (e) {
+        emit(log(
+          'PTPIP',
+          'InitFail — 相机拒绝握手（reason 0x'
+              '${e.reasonCode.toRadixString(16).padLeft(4, '0').toUpperCase()}），'
+              '通常表示未在相机上完成配对',
+          level: ConnectionLogLevel.error,
+        ));
+        await _teardown();
+        emit(ConnectionFailed(message: '相机拒绝握手', cause: e));
+      } on PtpTimeoutException catch (e) {
+        final tag = _timeoutTag(transportChannel);
+        final message = _timeoutMessage(transportChannel, e.message);
+        emit(log(tag, message, level: ConnectionLogLevel.error));
+        await _teardown();
+        emit(ConnectionFailed(message: message, cause: e));
+      } on PtpResponseException catch (e) {
+        final opName = e.opcode == null
+            ? '(unknown)'
+            : _opcodeName(e.opcode!);
+        final hint = _hintForResponse(e.code);
+        emit(log(
+          'CTRL',
+          '$opName 失败: ${e.codeLabel}${hint == null ? '' : ' — $hint'}',
+          level: ConnectionLogLevel.error,
+        ));
+        await _teardown();
+        emit(ConnectionFailed(
+          message:
+              '$opName 失败: ${e.codeLabel}${hint == null ? '' : ' — $hint'}',
+          cause: e,
+        ));
+      } on PtpTransportException catch (e) {
+        emit(log(
+          _timeoutTag(transportChannel),
+          e.message,
+          level: ConnectionLogLevel.error,
+        ));
+        await _teardown();
+        emit(ConnectionFailed(message: '传输层错误: ${e.message}', cause: e));
+      } on SocketException catch (e) {
+        emit(log(
+          'TCP',
+          _friendlySocketError(e),
+          level: ConnectionLogLevel.error,
+        ));
+        await _teardown();
+        emit(ConnectionFailed(message: _friendlySocketError(e), cause: e));
+      } on TimeoutException catch (e) {
+        final tag = _timeoutTag(transportChannel);
+        final message = _timeoutMessage(transportChannel, null);
+        emit(log(tag, message, level: ConnectionLogLevel.error));
+        await _teardown();
+        emit(ConnectionFailed(message: message, cause: e));
+      }
+    } finally {
+      await iccProgressSub?.cancel();
+      if (!out.isClosed) await out.close();
     }
   }
+
+  static String _timeoutTag(TransportChannel channel) => switch (channel) {
+        TransportChannel.wifi => 'TCP',
+        TransportChannel.usb => 'USB',
+        TransportChannel.icc => 'ICC',
+      };
+
+  static String _timeoutMessage(
+    TransportChannel channel,
+    String? underlying,
+  ) =>
+      switch (channel) {
+        // Historically ALL timeouts landed on the Wi-Fi copy; preserve it
+        // as the fixed message for wifi and add channel-specific copy for
+        // usb/icc. Ignoring `underlying` here keeps error surfaces stable
+        // for wifi users who were already trained on this wording.
+        TransportChannel.wifi => '连接超时（8s） — 相机 IP 或网络可能不可达',
+        TransportChannel.usb => 'USB 请求超时 — 检查数据线、USB 模式与相机电源',
+        TransportChannel.icc =>
+          'ICA 会话超时（120s） — 尝试重新插拔 USB-C 线；'
+              '如仍不行请在 iOS 设置 → 隐私与安全 → 有线配件里检查授权'
+              '${underlying == null ? '' : '（$underlying）'}',
+      };
+
+  /// Format a Swift-side [IccOpenProgress] event as a user-facing log line.
+  /// Returns null when the event carries no information worth surfacing.
+  static String? _iccProgressText(IccOpenProgress p) => switch (p.phase) {
+        'openSession' => '等待 ICA 会话打开…',
+        'catalog' => p.percent >= 0 ? '相机存储卡索引中… ${p.percent}%' : null,
+        'ready' => 'ICA 会话就绪',
+        'timeout' => 'ICA 会话打开超时',
+        _ => null,
+      };
 
   /// Cancels an in-flight handshake and tears the transport down.
   /// Safe to call multiple times.

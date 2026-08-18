@@ -412,12 +412,68 @@ class _ChannelSummary extends StatelessWidget {
   }
 }
 
-class _ConnLog extends StatelessWidget {
+class _ConnLog extends StatefulWidget {
   const _ConnLog({required this.lines});
   final List<ConnectionLog> lines;
 
   @override
+  State<_ConnLog> createState() => _ConnLogState();
+}
+
+class _ConnLogState extends State<_ConnLog> {
+  Timer? _ticker;
+  Stopwatch? _activeSw;
+  int _activeIndex = -1;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncActive();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ConnLog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncActive();
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  /// Detect whether the tail of the log is an active step and start / stop
+  /// the ticker accordingly. The ticker only runs while an active row exists,
+  /// so idle screens don't rebuild once a second forever.
+  void _syncActive() {
+    final lines = widget.lines;
+    final lastIdx = lines.length - 1;
+    final tail = lastIdx >= 0 ? lines[lastIdx] : null;
+    final isActive =
+        tail != null && tail.level == ConnectionLogLevel.active;
+
+    if (!isActive) {
+      _ticker?.cancel();
+      _ticker = null;
+      _activeSw = null;
+      _activeIndex = -1;
+      return;
+    }
+    if (lastIdx != _activeIndex) {
+      _activeIndex = lastIdx;
+      _activeSw = Stopwatch()..start();
+    }
+    _ticker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {});
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final lines = widget.lines;
+    final lastIdx = lines.length - 1;
     return Container(
       constraints: const BoxConstraints(minHeight: 40),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -429,13 +485,14 @@ class _ConnLog extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          for (final l in lines) _row(l),
+          for (int i = 0; i < lines.length; i++) _row(lines[i], i == lastIdx),
+          _stallHint(lastIdx >= 0 ? lines[lastIdx] : null),
         ],
       ),
     );
   }
 
-  Widget _row(ConnectionLog l) {
+  Widget _row(ConnectionLog l, bool isLast) {
     final color = switch (l.level) {
       ConnectionLogLevel.error => AppColors.danger,
       ConnectionLogLevel.active => AppColors.accent,
@@ -464,21 +521,39 @@ class _ConnLog extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          _trailing(l),
+          _trailing(l, isLast),
         ],
       ),
     );
   }
 
-  Widget _trailing(ConnectionLog l) {
+  Widget _trailing(ConnectionLog l, bool isLast) {
     if (l.level == ConnectionLogLevel.active) {
-      return const SizedBox(
-        width: 10,
-        height: 10,
-        child: CircularProgressIndicator(
-          strokeWidth: 1,
-          color: AppColors.accent,
-        ),
+      final elapsedText = isLast && _activeSw != null
+          ? '${_activeSw!.elapsed.inSeconds}s'
+          : null;
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (elapsedText != null) ...[
+            Text(
+              elapsedText,
+              style: AppTypography.mono.copyWith(
+                fontSize: 11,
+                color: AppColors.text4,
+              ),
+            ),
+            const SizedBox(width: 6),
+          ],
+          const SizedBox(
+            width: 10,
+            height: 10,
+            child: CircularProgressIndicator(
+              strokeWidth: 1,
+              color: AppColors.accent,
+            ),
+          ),
+        ],
       );
     }
     final ms = l.elapsedMs;
@@ -491,4 +566,39 @@ class _ConnLog extends StatelessWidget {
       ),
     );
   }
+
+  /// Extra italic hint below the active step once we've been stalled for
+  /// more than 10 s with no further log lines. The exact copy is chosen by
+  /// the tag of the active row so we can nudge users at the right layer
+  /// (ICC = check iOS trust dialog; TCP = check camera Wi-Fi; etc.).
+  Widget _stallHint(ConnectionLog? tail) {
+    if (tail == null || tail.level != ConnectionLogLevel.active) {
+      return const SizedBox.shrink();
+    }
+    final elapsedSec = _activeSw?.elapsed.inSeconds ?? 0;
+    if (elapsedSec < 10) return const SizedBox.shrink();
+    final hint = _hintForActive(tail.tag);
+    if (hint == null) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, left: 60),
+      child: Text(
+        hint,
+        style: AppTypography.mono.copyWith(
+          fontSize: 10,
+          color: AppColors.text4,
+          fontStyle: FontStyle.italic,
+        ),
+      ),
+    );
+  }
+
+  static String? _hintForActive(String tag) => switch (tag) {
+        'ICC' =>
+          '提示：iOS 每次连接都可能等待系统权限或相机内部准备。'
+              '请留意手机屏幕是否有「允许有线配件」对话框；'
+              '若确认已授权，可尝试拔插一次 USB-C 线。',
+        'TCP' => '提示：请确认手机已加入相机 Wi-Fi 且 IP 可达。',
+        'USB' => '提示：请检查数据线以及相机的 USB 模式（应为 MTP/PTP）。',
+        _ => null,
+      };
 }

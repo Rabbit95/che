@@ -208,5 +208,66 @@ void main() {
       await transport.close();
       expect(fake.closedCount, 1);
     });
+
+    test('open throws PtpTimeoutException when openSession stalls past deadline',
+        () async {
+      final blockingFake = _BlockingHostApi();
+      final t = IccTransport(
+        api: blockingFake,
+        openTimeout: const Duration(milliseconds: 40),
+      );
+      await expectLater(
+        t.open(TransportConfig.icc(iccDeviceId: 'icc-slow')),
+        throwsA(
+          isA<PtpTimeoutException>()
+              .having((e) => e.message, 'message', contains('ICA openSession')),
+        ),
+      );
+      expect(t.state, TransportState.failed);
+      await t.close();
+    });
+
+    test('openProgress stream forwards Swift heartbeats as IccOpenProgress',
+        () async {
+      await transport.open(TransportConfig.icc(iccDeviceId: 'icc-x'));
+      final progress = <IccOpenProgress>[];
+      final sub = transport.openProgress.listen(progress.add);
+
+      // Simulate Swift-side pushes.
+      IccPtpChannel.instance
+          .onSessionOpenProgress('icc-x', 'catalog', 30, 850);
+      IccPtpChannel.instance
+          .onSessionOpenProgress('icc-x', 'ready', 100, 1400);
+      // Stale event from a different device must be dropped.
+      IccPtpChannel.instance
+          .onSessionOpenProgress('icc-other', 'catalog', 99, 200);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(progress, hasLength(2));
+      expect(progress[0].phase, 'catalog');
+      expect(progress[0].percent, 30);
+      expect(progress[0].elapsedMs, 850);
+      expect(progress[1].phase, 'ready');
+      expect(progress[1].percent, 100);
+      await sub.cancel();
+    });
   });
+}
+
+/// Never resolves — used to test the [IccTransport] open-timeout deadline.
+class _BlockingHostApi extends IccPtpHostApi {
+  _BlockingHostApi();
+
+  final Completer<bool> _never = Completer<bool>();
+
+  @override
+  Future<bool> openSession(String deviceId) => _never.future;
+
+  @override
+  Future<PtpCommandResult> sendCommand(PtpCommand command) async {
+    return PtpCommandResult(responseCode: 0x2001, responseParams: const []);
+  }
+
+  @override
+  Future<void> closeSession() async {}
 }

@@ -332,8 +332,29 @@ abstract class IccPtpFlutterApi {
   /// The active session ended for a reason other than an explicit close —
   /// device unplugged, camera powered off, or an internal ICA error.
   ///
-  /// [reason] is one of: `'unplug'`, `'error'`, `'authRevoked'`.
+  /// [reason] is one of: `'unplug'`, `'error'`, `'authRevoked'`, `'timeout'`.
   void onSessionEnded(String deviceId, String reason);
+
+  /// Progress heartbeat during a pending [openSession] call.
+  ///
+  /// The Swift coordinator emits these at key transitions so the UI can
+  /// tell "still waiting on Apple" from "media catalog is 40 % scanned"
+  /// from "we hit the watchdog":
+  ///
+  /// - [phase] `'openSession'` — `requestOpenSession()` was issued and
+  ///   we are waiting on `didOpenSessionWithError`. [percent] is `-1`.
+  /// - [phase] `'catalog'` — KVO update on
+  ///   `ICCameraDevice.contentCatalogPercentCompleted`. [percent] is
+  ///   in `[0, 100]`.
+  /// - [phase] `'ready'` — `didOpenSessionWithError(nil)` fired.
+  ///   [percent] is `100`.
+  /// - [phase] `'timeout'` — the 120 s watchdog fired before ICA
+  ///   responded. [percent] is `-1`. An `onSessionEnded(reason:'timeout')`
+  ///   follows.
+  ///
+  /// [elapsedMs] is measured from the start of the pending
+  /// `openSession` call on the Swift side.
+  void onSessionOpenProgress(String deviceId, String phase, int percent, int elapsedMs);
 
   static void setUp(IccPtpFlutterApi? api, {BinaryMessenger? binaryMessenger, String messageChannelSuffix = '',}) {
     messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
@@ -437,6 +458,40 @@ abstract class IccPtpFlutterApi {
               'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionEnded was null, expected non-null String.');
           try {
             api.onSessionEnded(arg_deviceId!, arg_reason!);
+            return wrapResponse(empty: true);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          }          catch (e) {
+            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+    {
+      final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress$messageChannelSuffix', pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          assert(message != null,
+          'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null.');
+          final List<Object?> args = (message as List<Object?>?)!;
+          final String? arg_deviceId = (args[0] as String?);
+          assert(arg_deviceId != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null, expected non-null String.');
+          final String? arg_phase = (args[1] as String?);
+          assert(arg_phase != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null, expected non-null String.');
+          final int? arg_percent = (args[2] as int?);
+          assert(arg_percent != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null, expected non-null int.');
+          final int? arg_elapsedMs = (args[3] as int?);
+          assert(arg_elapsedMs != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null, expected non-null int.');
+          try {
+            api.onSessionOpenProgress(arg_deviceId!, arg_phase!, arg_percent!, arg_elapsedMs!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

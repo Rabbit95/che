@@ -124,6 +124,32 @@ abstract class IccPtpFlutterApi {
   /// The active session ended for a reason other than an explicit close —
   /// device unplugged, camera powered off, or an internal ICA error.
   ///
-  /// [reason] is one of: `'unplug'`, `'error'`, `'authRevoked'`.
+  /// [reason] is one of: `'unplug'`, `'error'`, `'authRevoked'`, `'timeout'`.
   void onSessionEnded(String deviceId, String reason);
+
+  /// Progress heartbeat during a pending [openSession] call.
+  ///
+  /// The Swift coordinator emits these at key transitions so the UI can
+  /// tell "still waiting on Apple" from "media catalog is 40 % scanned"
+  /// from "we hit the watchdog":
+  ///
+  /// - [phase] `'openSession'` — `requestOpenSession()` was issued and
+  ///   we are waiting on `didOpenSessionWithError`. [percent] is `-1`.
+  /// - [phase] `'catalog'` — KVO update on
+  ///   `ICCameraDevice.contentCatalogPercentCompleted`. [percent] is
+  ///   in `[0, 100]`.
+  /// - [phase] `'ready'` — `didOpenSessionWithError(nil)` fired.
+  ///   [percent] is `100`.
+  /// - [phase] `'timeout'` — the 120 s watchdog fired before ICA
+  ///   responded. [percent] is `-1`. An `onSessionEnded(reason:'timeout')`
+  ///   follows.
+  ///
+  /// [elapsedMs] is measured from the start of the pending
+  /// `openSession` call on the Swift side.
+  void onSessionOpenProgress(
+    String deviceId,
+    String phase,
+    int percent,
+    int elapsedMs,
+  );
 }

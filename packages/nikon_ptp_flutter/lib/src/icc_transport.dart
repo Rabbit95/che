@@ -1,11 +1,37 @@
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:nikon_ptp/nikon_ptp.dart';
 
 import 'icc_channel.dart';
 import 'pigeon/icc_ptp.g.dart';
+
+/// A single heartbeat pushed by the Swift coordinator while an
+/// [IccTransport.open] call is pending or shortly after it succeeds.
+///
+/// See `IccPtpFlutterApi.onSessionOpenProgress` in the pigeon schema for
+/// the meaning of each [phase] value.
+@immutable
+final class IccOpenProgress {
+  const IccOpenProgress({
+    required this.deviceId,
+    required this.phase,
+    required this.percent,
+    required this.elapsedMs,
+  });
+
+  final String deviceId;
+
+  /// One of `'openSession' | 'catalog' | 'ready' | 'timeout'`.
+  final String phase;
+
+  /// `[0, 100]` for `catalog`; `-1` when unknown.
+  final int percent;
+
+  /// Milliseconds since the Swift side received the openSession request.
+  final int elapsedMs;
+}
 
 /// iOS ICCameraDevice transport (iPhone USB-C + iPad USB-C/Lightning).
 ///
@@ -17,15 +43,29 @@ import 'pigeon/icc_ptp.g.dart';
 ///
 /// Transaction ids start at 1 and are monotonically increasing per session,
 /// matching the USB / Wi-Fi transports.
+///
+/// Observability (Phase A): [openProgress] surfaces the heartbeats the
+/// Swift coordinator emits while `requestOpenSession` is pending — this
+/// is how the UI distinguishes "waiting on Apple" from "catalog is 40 %
+/// scanned" from "watchdog fired". [openTimeout] guarantees the future
+/// returned by [open] resolves within a bounded time; the default 120 s
+/// matches the Swift-side watchdog.
 final class IccTransport implements Transport {
-  IccTransport({IccPtpHostApi? api}) : _api = api ?? IccPtpHostApi();
+  IccTransport({
+    IccPtpHostApi? api,
+    Duration openTimeout = const Duration(seconds: 120),
+  })  : _api = api ?? IccPtpHostApi(),
+        _openTimeout = openTimeout;
 
   final IccPtpHostApi _api;
+  final Duration _openTimeout;
 
   final StreamController<CameraEvent> _events =
       StreamController<CameraEvent>.broadcast();
   final StreamController<TransportState> _states =
       StreamController<TransportState>.broadcast();
+  final StreamController<IccOpenProgress> _progress =
+      StreamController<IccOpenProgress>.broadcast();
 
   TransportState _state = TransportState.idle;
   int _nextTxId = 1;
@@ -42,6 +82,12 @@ final class IccTransport implements Transport {
 
   @override
   Stream<CameraEvent> get events => _events.stream;
+
+  /// Progress heartbeats from the Swift coordinator during (and shortly
+  /// after) [open]. Non-contract — consumed by
+  /// `ConnectionController._runHandshake` when [channel] is
+  /// [TransportChannel.icc].
+  Stream<IccOpenProgress> get openProgress => _progress.stream;
 
   void _setState(TransportState next) {
     if (_state == next) return;
@@ -63,8 +109,17 @@ final class IccTransport implements Transport {
     // don't miss a stray event fired during the window.
     IccPtpChannel.instance.setPtpEventListener(_onPtpEvent);
     IccPtpChannel.instance.setSessionEndedListener(_onSessionEnded);
+    IccPtpChannel.instance.setSessionOpenProgressListener(_onOpenProgress);
     try {
-      final ok = await _api.openSession(deviceId);
+      final ok = await _api.openSession(deviceId).timeout(
+        _openTimeout,
+        onTimeout: () {
+          throw PtpTimeoutException(
+            'ICA openSession 超时（${_openTimeout.inSeconds}s） '
+            '— 未在时限内收到 didOpenSessionWithError 回调',
+          );
+        },
+      );
       if (!ok) {
         _detachChannel();
         _setState(TransportState.failed);
@@ -74,6 +129,10 @@ final class IccTransport implements Transport {
       }
       _iccDeviceId = deviceId;
       _setState(TransportState.ready);
+    } on PtpTimeoutException {
+      _detachChannel();
+      _setState(TransportState.failed);
+      rethrow;
     } on PlatformException catch (e) {
       _detachChannel();
       _setState(TransportState.failed);
@@ -103,11 +162,30 @@ final class IccTransport implements Transport {
     _setState(TransportState.failed);
   }
 
+  void _onOpenProgress(
+    String deviceId,
+    String phase,
+    int percent,
+    int elapsedMs,
+  ) {
+    if (_progress.isClosed) return;
+    // Filter by device id once we know ours, so a stale coordinator event
+    // from a previous session can't leak into the current UI.
+    if (_iccDeviceId != null && deviceId != _iccDeviceId) return;
+    _progress.add(IccOpenProgress(
+      deviceId: deviceId,
+      phase: phase,
+      percent: percent,
+      elapsedMs: elapsedMs,
+    ));
+  }
+
   /// Detach this transport from the shared channel. Safe to call
   /// repeatedly; only clears if the current listener is ours.
   void _detachChannel() {
     IccPtpChannel.instance.setPtpEventListener(null);
     IccPtpChannel.instance.setSessionEndedListener(null);
+    IccPtpChannel.instance.setSessionOpenProgressListener(null);
   }
 
   @override
@@ -186,5 +264,6 @@ final class IccTransport implements Transport {
     _setState(TransportState.closed);
     if (!_events.isClosed) await _events.close();
     if (!_states.isClosed) await _states.close();
+    if (!_progress.isClosed) await _progress.close();
   }
 }
