@@ -1,0 +1,50 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+pubspec.lock
+
+# Generated
+*.g.dart.orig
+*.freezed.dart.orig
+generated_plugin_registrant.*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+.metadata
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Flutter platform build outputs
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/android/.gradle/
+app/android/local.properties
+app/android/**/GeneratedPluginRegistrant.java
+app/ios/Flutter/Flutter.podspec
+app/ios/Flutter/flutter_export_environment.sh
+app/ios/Flutter/Generated.xcconfig
+app/ios/Runner/GeneratedPluginRegistrant.*
+app/ios/Pods/
+app/ios/Podfile.lock
+
+# Local
+*.local.dart
+*.log
+scratch/
+.tmp/
+
+# Secrets
+*.p12
+*.mobileprovision
+*.cer
+.env
+.env.*
+!.env.example

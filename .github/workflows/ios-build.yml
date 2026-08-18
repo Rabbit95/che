@@ -1,0 +1,51 @@
+name: Build iOS IPA (unsigned)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.7'
+          channel: stable
+          cache: true
+
+      - name: Install melos
+        run: dart pub global activate melos
+
+      - name: Bootstrap workspace
+        run: melos bootstrap
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+        working-directory: app
+
+      - name: Build iOS (no codesign)
+        run: flutter build ios --release --no-codesign
+        working-directory: app
+
+      - name: Package unsigned IPA
+        working-directory: app/build/ios/iphoneos
+        run: |
+          mkdir -p Payload
+          cp -r Runner.app Payload/
+          zip -qq -r -9 nikon_z_control-unsigned.ipa Payload
+          ls -lh nikon_z_control-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikon_z_control-unsigned-ipa
+          path: app/build/ios/iphoneos/nikon_z_control-unsigned.ipa
+          retention-days: 14

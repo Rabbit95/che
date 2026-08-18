@@ -1,0 +1,57 @@
+name: nikon_z_control
+
+packages:
+  - app
+  - packages/*
+  - tools/*
+
+command:
+  bootstrap:
+    runPubGetInParallel: true
+
+scripts:
+  analyze:
+    run: dart analyze
+    exec:
+      concurrency: 4
+    description: Run dart analyze in every package
+
+  test:
+    run: dart test
+    exec:
+      concurrency: 2
+      failFast: false
+    packageFilters:
+      dirExists:
+        - test
+    description: Run dart tests where a test/ directory exists
+
+  test:flutter:
+    run: flutter test
+    exec:
+      concurrency: 1
+    packageFilters:
+      flutter: true
+      dirExists:
+        - test
+    description: Run flutter tests
+
+  format:
+    run: dart format --set-exit-if-changed .
+    exec:
+      concurrency: 4
+    description: Verify formatting
+
+  format:fix:
+    run: dart format .
+    exec:
+      concurrency: 4
+    description: Apply formatting fixes
+
+  gen:
+    run: dart run build_runner build --delete-conflicting-outputs
+    exec:
+      concurrency: 1
+    packageFilters:
+      dependsOn: build_runner
+    description: Run code generation

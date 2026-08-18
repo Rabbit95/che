@@ -1,0 +1,27 @@
+name: nikon_z_control_workspace
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+workspace:
+  - app
+  - packages/nikon_ptp
+  - packages/nikon_ptp_flutter
+  - tools/ptp_replay_server
+
+# Dependency overrides applied across the whole workspace.
+#
+# - `quick_usb`: point at our local fork (packages/quick_usb_patched) rather
+#   than pub cache. The published 0.4.0 is compileSdkVersion 30 but its
+#   Kotlin source references API 31 symbols — a compile-time impossibility
+#   on machines missing SDK Platform 31. The fork patches the Kotlin and
+#   bumps compileSdkVersion to 34.
+# - `ffi`: quick_usb 0.4.0 declares ffi ^1.2.0, but bonsoir → dbus needs
+#   ffi ^2.0.0. Force ffi 2.x — on Android quick_usb uses MethodChannel
+#   (not FFI), so this only affects desktop targets where it may need
+#   testing.
+dependency_overrides:
+  ffi: ^2.1.0
+  quick_usb:
+    path: packages/quick_usb_patched

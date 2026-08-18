@@ -1,0 +1,35 @@
+name: nikon_ptp_flutter
+description: Flutter-side transport implementations for the nikon_ptp protocol package.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+  flutter: '>=3.24.0'
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  nikon_ptp:
+    path: ../nikon_ptp
+  quick_usb: ^0.4.0
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.1.0
+
+# NOTE: not declared as a `flutter.plugin` yet — current transports are pure
+# Dart (Wi-Fi Socket) or throwing stubs. When M6 wires the Android USB
+# (flutter_quick_usb) and iOS ImageCapture channels, add:
+#
+# flutter:
+#   plugin:
+#     platforms:
+#       android: { pluginClass: NikonPtpFlutterPlugin, package: com.rabbit.nikon_ptp_flutter }
+#       ios:     { pluginClass: NikonPtpFlutterPlugin }
+#
+# ...and create the corresponding Kotlin + Swift files.

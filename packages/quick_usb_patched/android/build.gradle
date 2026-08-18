@@ -1,0 +1,57 @@
+group 'com.example.quick_usb'
+version '1.0-SNAPSHOT'
+
+buildscript {
+    ext.kotlin_version = '1.5.30'
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:4.1.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    // Bumped from pub-cache original (30) to 34 — the plugin's Kotlin
+    // references APIs added in SDK 31 (Build.VERSION_CODES.S,
+    // PendingIntent.FLAG_MUTABLE, though we've patched those out to
+    // numeric literals as defence in depth). Also required so the
+    // library JAR doesn't drag old android.jar in front of the app's
+    // newer compileSdk during resolution.
+    compileSdkVersion 34
+    namespace 'com.example.quick_usb'
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        minSdkVersion 21
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+}

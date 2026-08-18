@@ -1,0 +1,17 @@
+name: ptp_replay_server
+description: PTP-IP replay server for CI integration tests (replays recorded byte traces on port 15740).
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dependencies:
+  nikon_ptp:
+    path: ../../packages/nikon_ptp
+
+dev_dependencies:
+  lints: ^5.1.0
+  test: ^1.25.0
