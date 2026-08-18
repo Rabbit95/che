@@ -343,12 +343,12 @@ Isolate：协议层留在主 isolate（Socket 本身异步）。仅在低端 And
 
 ---
 
-## Progress 快照（更新于 2026-08-18，M6b iOS 通道完成 + GitHub Actions 免签 IPA 流水线）
+## Progress 快照（更新于 2026-08-18，M1 mDNS 收尾完成 + M6b iOS 通道完成 + GitHub Actions 免签 IPA 流水线）
 
 | 里程碑 | 状态 | 已完成 | 未完成 |
 |---|---|---|---|
 | **M0 基础脚手架** | ✅ 完成 | Workspace + melos + analysis_options；`nikon_ptp` 常量层 + 数据模型 + codec（PTP-IP + PTP-USB + PTP 数据结构）+ Transport 接口 + `PtpSession`（含优先级 OperationQueue）+ `NikonZClient` 高层 API；64 个单元测试全绿 | — |
-| **M1 发现 + Wi-Fi 连接** | 🟡 部分 | `PtpIpTransport` 双 Socket 完整握手（InitCommand/InitEvent Ack）+ 持久化 client GUID（`ClientGuidStore` via shared_preferences）+ `ChangeApplicationMode(1)` 进入控制模式（且 AccessDenied 优雅降级）；`ConnectingScreen` 真实握手，日志流可视化 | mDNS 发现（bonsoir 只加了依赖，未接入 `discoveryProvider`）；Wi-Fi 侧真机验证 |
+| **M1 发现 + Wi-Fi 连接** | ✅ 完成 | `PtpIpTransport` 双 Socket 完整握手（InitCommand/InitEvent Ack）+ 持久化 client GUID（`ClientGuidStore` via shared_preferences）+ `ChangeApplicationMode(1)` 进入控制模式（且 AccessDenied 优雅降级）；`ConnectingScreen` 真实握手，日志流可视化；**mDNS 发现完整化**：`WifiCameraDiscovery`（`packages/nikon_ptp_flutter/lib/src/wifi_discovery.dart`）用 bonsoir 订阅 `_ptp._tcp` + `_nikon._tcp`（可配置），push-based（无轮询）— `serviceFound → resolve → serviceResolved` 三段状态机，按 service name 去重，`serviceLost` 自动摘除；`wifiCameraDiscoveryProvider` 在 Android/iOS/macOS 启用（Windows/Linux 留 empty，未验证）→ merge 进 `discoveryProvider`；`iOS Info.plist` 加 `NSLocalNetworkUsageDescription` + `NSBonjourServices=[_ptp._tcp, _nikon._tcp]`（iOS 14+ 强制要求）；Android manifest 加 `INTERNET/ACCESS_NETWORK_STATE/ACCESS_WIFI_STATE/CHANGE_WIFI_MULTICAST_STATE/NEARBY_WIFI_DEVICES(neverForLocation)`；**15 个 `WifiCameraDiscovery` 单测**覆盖初始空快照 / start-stop 生命周期 / found→resolve→resolved 转换 / host 缺失静默 drop / duplicate resolve in-place update / lost 未知 name 不 spam / resolve 失败不炸流 / event-stream 错误透传 / 多服务类型 merge | Wi-Fi 侧真机验证（相机→AP→App 端到端） |
 | **M2 DeviceInfo + 读参数** | ✅ 完成 | `getDeviceInfo` / `getStorageIds` / `getStorageInfo` / `getObjectHandles` / `getObjectInfo` / `getPropertyDesc` / `pollEvents` 全部在 `NikonZClient` 里实装；`connect()` 自动调 GetDeviceInfo；`PropFormatter` 覆盖 ISO/快门/光圈/EV/WB/AF/曝光模式/驱动/电量/焦距/闪光/测光（21 个单元测试）；`cameraPropertiesProvider` 事件驱动 + 500ms 兜底轮询（9 个 provider 测试）；参数抽屉屏 + LiveView 顶部 ExposureBar 全部接真值，只读属性显示 🔒 图标 | 参数写入 UI（属于 M3） |
 | **M3 写参数 + 遥控快门** | ✅ 完成 | `setProperty` / `capture` / `startMovieRecording` / `stopMovieRecording` / `_waitDeviceReady` 已实装（client 层）；`CameraCommands` 门面统一包装错误 → `CameraControlFailure` 带中文 hint；`cameraCommandsProvider` 从 activeConnectionProvider 拿 client；参数抽屉行 tap 弹选值 sheet（EnumForm 显示可选枚举高亮当前值，RangeForm 显示带 step 的 slider），非可写属性显示 🔒 图标不响应 tap；LiveView 快门键 tap → `capture()` + haptic + SnackBar 反馈，in-flight 期间灰化；视频模式 tap → `startMovieRecording/stopMovieRecording` + HUD 秒级 Timer.periodic，录像期间锁定模式切换以避免竞态；11 个 `CameraCommands` 单元测试 | 静默失败重试策略、连拍/自定义存储卡目标（走 `capture(storageId:)`）暂未做 |
 | **M4 Live View (Wi-Fi + USB)** | ✅ 主线完成 | `startLiveView` / `stopLiveView` / `getLiveViewFrame` API 就绪；`LiveViewFrameCodec.decode` 按 JPEG SOI 拆头 + JPEG，尽力解析图像宽高 + AF/焦点框（10 个单测）；`NikonZClient.getLiveViewFrameDecoded` + `tapToFocus`（7 个单测，含 AF-out-of-focus 静默降级）；App 层 `runLiveView` 自调度 30 Hz 循环 + 滚窗 FPS 计算 + 启动/取消状态机（6 个单测）；`liveViewProvider` autoDispose Stream；LV 屏 `LvScene` 用 `Image.memory(gaplessPlayback: true)` 渲染真实 JPEG，warmup/error 态回退暖色渐变；LV 屏 tap → `tapToFocus`，屏幕坐标按帧宽高缩放；HUD fps 显示实测滚窗值。**整条管线走 `NikonZClient` → `PtpSession` → `Transport` 抽象，Wi-Fi 和 USB 共用同一份代码路径，无 channel 分支** —— M6a 已经让 `UsbTransport` 真机走通，所以插 USB 打开 LV 屏就直接工作；原 M6 里"USB 上再跑通一次 LV"这一项因此不需要单独实现 | 真机 fps 实测（Wi-Fi 目标 ≥20 fps，USB 目标 ≥30 fps）；LV header 更多字段（histogram/exposure）；MfDrive 微调步进；LV 帧 JPEG 解码切 isolate 的低端设备优化；`LiveViewStateChanged=0xC10C` 事件订阅重连（当前完全靠 30 Hz 主动拉取） |
@@ -379,8 +379,7 @@ Isolate：协议层留在主 isolate（Socket 本身异步）。仅在低端 And
 
 ### 下一步优先级建议
 
-1. **M1 mDNS 完整化 (iOS 收尾)**：iPhone 现在能走 USB-C,但连相机 Wi-Fi 只看到硬编码假条目。加 Bonsoir 真实流 + Info.plist 里 `NSLocalNetworkUsageDescription` 和 `NSBonjourServices`（列 `_ptp._tcp`）
-2. **M5 Gallery/Transfer 对接**（首屏可用性最大）：Gallery 用 `getObjectHandles + getThumb`；Transfer 用 `downloadObject` + `photo_manager`；顺手在 PtpSession.events 里挂 ObjectAdded (0x4002) 监听,拍照自动进队列
-3. **M4 真机验证**：拿实测 fps + 确认 LV header 偏移量在当前固件下正确
+1. **M5 Gallery/Transfer 对接**（首屏可用性最大）：Gallery 用 `getObjectHandles + getThumb`；Transfer 用 `downloadObject` + `photo_manager`；顺手在 PtpSession.events 里挂 ObjectAdded (0x4002) 监听,拍照自动进队列
+2. **M4 真机验证**：拿实测 fps + 确认 LV header 偏移量在当前固件下正确
+3. **M1 Wi-Fi 侧真机验证**：mDNS 代码路径已完整，需要真机端到端跑一遍（相机开 AP → App 端 bonsoir 发现 → tap 卡片 → PtpIpTransport 握手 → 参数读写 / LV / 拍照）
 4. **M7 重连状态机**：断网/挂起/后台切换的 keepalive + 自动重连（现在 unplug 已经有基础,能扩展到 Wi-Fi 断线场景）
-5. **widget_smoke_test 修复**（技术债）：DiscoveryScreen 已不再硬编码 "Nikon Z8"/"Nikon Z6III"，测试断言过期需重写

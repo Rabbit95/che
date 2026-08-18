@@ -10,6 +10,7 @@ environment:
 resolution: workspace
 
 dependencies:
+  bonsoir: ^5.1.10
   flutter:
     sdk: flutter
   nikon_ptp:

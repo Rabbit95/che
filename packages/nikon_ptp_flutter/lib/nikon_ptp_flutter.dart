@@ -13,3 +13,4 @@ export 'src/nikon_usb_ids.dart';
 export 'src/ptpip_transport.dart';
 export 'src/usb_discovery.dart';
 export 'src/usb_transport.dart';
+export 'src/wifi_discovery.dart';

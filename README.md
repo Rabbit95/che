@@ -8,7 +8,7 @@ Flutter 跨平台 App（Android + iOS 全通道打通），控制尼康 Z 系列
 
 ---
 
-## 当前实际可用范围（更新于 2026-08-18，M6b iOS ImageCaptureCore 通道完成 + GitHub Actions 免签 IPA 流水线）
+## 当前实际可用范围（更新于 2026-08-18，M1 mDNS 收尾 + M6b iOS ImageCaptureCore 通道完成 + GitHub Actions 免签 IPA 流水线）
 
 真机验证：
 - **STF AL00（Android 9）+ Nikon Z 系列 USB 直连**：握手 / 遥控快门 / 参数写入 / 录像启停跑通
@@ -18,7 +18,7 @@ Flutter 跨平台 App（Android + iOS 全通道打通），控制尼康 Z 系列
 |---|---|---|
 | 相机发现（Android USB） | ✅ 可用 | 2s 轮询 `getDeviceList` + Nikon VID/PID 匹配；插入相机 Android 弹权限对话框允许后自动出现在列表 |
 | 相机发现（iOS USB-C） | ✅ 可用 | 走 `ICDeviceBrowser` 推 `didAdd/didRemove` 回调（无轮询）；首次插上系统弹"允许有线配件"权限对话框 |
-| 相机发现（Wi-Fi mDNS） | 🟡 占位 | 列表里有一张固定假卡；bonsoir 依赖已在 pubspec，但 provider 里未接 |
+| 相机发现（Wi-Fi mDNS） | ✅ 可用 | `WifiCameraDiscovery` 用 bonsoir 订阅 `_ptp._tcp` + `_nikon._tcp`（PIMA 15740 PTP-IP 标准类型 + Nikon 私有类型兜底）；`serviceFound → resolve → serviceResolved` 三段状态机，去重按 service name；`serviceLost` 自动摘除。iOS Info.plist 已声明 `NSLocalNetworkUsageDescription` + `NSBonjourServices`；Android manifest 已加 `CHANGE_WIFI_MULTICAST_STATE` + `NEARBY_WIFI_DEVICES(neverForLocation)`。真机端到端未验证 |
 | 连接握手 | ✅ 可用 | 真实 PTP-USB / PTP-IP / ICA 握手 + OpenSession + GetDeviceInfo + ChangeApplicationMode(1) + DeviceReady 轮询；iOS 侧 OpenSession/CloseSession opcode 在 Pigeon 桥拦截合成 OK,由 ICA `requestOpenSession/requestCloseSession` 管会话生命周期；日志逐条流式显示 |
 | 错误诊断 | ✅ 可用 | 错误 log 显示 opcode 名 + response code 名 + 中文排障提示（AccessDenied / SessionAlreadyOpen / DeviceBusy 等） |
 | Live View 屏 UI | ✅ 可用 | HUD/曝光条/AF 框/直方图/波形图/快门键/模式切换全部按 mockup 实装 |
@@ -38,12 +38,17 @@ Flutter 跨平台 App（Android + iOS 全通道打通），控制尼康 Z 系列
 PTP 数据结构（DeviceInfo/StorageInfo/ObjectInfo/DevicePropDesc）、PacketFramer 跨 chunk 重组、
 `PropFormatter` 21 个属性格式化用例、`LiveViewFrameCodec` 10 个用例（JPEG SOI 定位、AF 框/焦点区解析、
 短包/空包/坏时间戳兜底）、`NikonZClient.tapToFocus` + `getLiveViewFrameDecoded` 7 个用例。
-**Flutter 侧 12 个 `IccTransport` 测试**覆盖 open 状态机 / sendTransaction txId 单调 / PtpResponse 拼装 /
-dataOut 转发 / PTP event → CameraEvent 流 / hot-unplug `onSessionEnded` / close 幂等（`packages/nikon_ptp_flutter/test/icc_transport_test.dart`）。
-**App 层 26 个 provider 测试**覆盖 `cameraPropertiesProvider` 的初始读、事件驱动 refresh、兜底轮询、取消清理（9 个），
+**Flutter 侧 27 个测试**：12 个 `IccTransport` 测试覆盖 open 状态机 / sendTransaction txId 单调 / PtpResponse 拼装 /
+dataOut 转发 / PTP event → CameraEvent 流 / hot-unplug `onSessionEnded` / close 幂等
+（`packages/nikon_ptp_flutter/test/icc_transport_test.dart`）；**15 个 `WifiCameraDiscovery` 测试**覆盖初始空快照 /
+subscribe→ready→start 生命周期 / found→resolve→resolved 三段转换 / host 缺失静默 drop /
+duplicate resolve in-place update / lost 未知 name 不 spam / resolve 失败不炸流 /
+event-stream 错误透传 / 多服务类型 merge（`packages/nikon_ptp_flutter/test/wifi_discovery_test.dart`）。
+**App 层 27 个测试**覆盖 `cameraPropertiesProvider` 的初始读、事件驱动 refresh、兜底轮询、取消清理（9 个），
 `CameraCommands` 的 capture/start-stop movie/setProperty 分发 + 中文排障提示映射（11 个），
-以及 `runLiveView` 状态机（starting→running→frame、start 失败、单帧错误恢复、cancel 收尾 stopLiveView、
-FPS 滚窗计算、warmup null 帧静默跳过）6 个用例。合计 **93 + 26 = 119 个测试**。
+`runLiveView` 状态机（starting→running→frame、start 失败、单帧错误恢复、cancel 收尾 stopLiveView、
+FPS 滚窗计算、warmup null 帧静默跳过）6 个用例，以及 `DiscoveryScreen` 挂 fake `discoveryProvider`
+的 widget smoke 1 个。合计 **81 + 27 + 27 = 135 个测试**。
 
 ---
 
@@ -93,6 +98,7 @@ D:\rabbit\code\che\
 │   │   │   ├── icc_channel.dart       # IccPtpChannel singleton demux（FlutterApi ↔ discovery + transport）
 │   │   │   ├── icc_discovery.dart     # iOS ICDeviceBrowser 订阅式发现（无轮询）
 │   │   │   ├── usb_discovery.dart     # USB 设备轮询
+│   │   │   ├── wifi_discovery.dart    # mDNS 发现（bonsoir _ptp._tcp / _nikon._tcp，push-based）
 │   │   │   ├── nikon_usb_ids.dart     # Nikon VID/PID 表
 │   │   │   ├── client_guid_store.dart # 持久化 client GUID
 │   │   │   └── pigeon\icc_ptp.g.dart  # Pigeon 生成的 Dart bindings
@@ -104,7 +110,8 @@ D:\rabbit\code\che\
 │   │   │       ├── IccDeviceCoordinator.swift  # ICDeviceBrowser + PTP 命令桥
 │   │   │       └── IccPtpMessages.g.swift   # Pigeon 生成的 Swift bindings
 │   │   └── test\
-│   │       └── icc_transport_test.dart  # 12 个 IccTransport 单测
+│   │       ├── icc_transport_test.dart  # 12 个 IccTransport 单测
+│   │       └── wifi_discovery_test.dart # 15 个 WifiCameraDiscovery 单测
 │   └── quick_usb_patched\             # quick_usb 0.4.0 的本地 fork（Android 补丁）
 ├── tools\
 │   └── ptp_replay_server\             # （空目录，CI 用的 PTP-IP 字节回放服务器待建）
@@ -200,6 +207,9 @@ flutter test test/camera_properties_provider_test.dart test/camera_control_provi
 - **协议包纯 Dart**：`packages/nikon_ptp` 不依赖 Flutter，方便桌面复用和 headless 单测。
 - **Transport 抽象**：`PtpIpTransport`（Wi-Fi）/ `UsbTransport`（Android）/ `IccTransport`（iOS）
   三实现共用同一 `Transport` 接口，`PtpSession` 和 `NikonZClient` 上层完全对通道无感知。
+- **Discovery 抽象**：`UsbCameraDiscovery`（quick_usb 轮询）/ `IccCameraDiscovery`（iOS ICDeviceBrowser 订阅）/
+  `WifiCameraDiscovery`（bonsoir mDNS `_ptp._tcp` + `_nikon._tcp` 订阅）三源在 `discoveryProvider` 里 merge
+  成一份 `List<DiscoveredCamera>`。UI 层只看到统一的相机列表，不关心它是从哪条通道冒出来的。
 - **PTP-USB vs PTP-IP 编解码分离**：`PtpIpCodec` 是长度前缀 + 14 种包类型；`PtpUsbCodec` 是
   12B container header（USB Still Image Class 1.0）。两个 codec 各有黄金字节向量单测。
 - **iOS 走 ImageCaptureCore**：Swift 侧 `IccDeviceCoordinator` 封 `ICDeviceBrowser` +

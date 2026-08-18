@@ -82,13 +82,35 @@ final StreamProvider<List<IccCameraDescriptor>> iccCameraDiscoveryProvider =
   return IccCameraDiscovery().watch();
 });
 
+/// Stream of Nikon bodies advertising themselves on the local network via
+/// mDNS (`_ptp._tcp`, the PIMA 15740 PTP-IP standard type).
+///
+/// Enabled on Android + iOS + macOS. Web / Windows / Linux fall through
+/// with an empty stream — Bonsoir supports Windows/Linux via its own
+/// plugins but we haven't validated them against a Nikon body yet, and
+/// on the target platforms the App is bound to Android/iOS anyway.
+final StreamProvider<List<WifiCameraDescriptor>> wifiCameraDiscoveryProvider =
+    StreamProvider<List<WifiCameraDescriptor>>((ref) {
+  if (kIsWeb) return const Stream.empty();
+  switch (defaultTargetPlatform) {
+    case TargetPlatform.android:
+    case TargetPlatform.iOS:
+    case TargetPlatform.macOS:
+      return WifiCameraDiscovery().watch();
+    case TargetPlatform.windows:
+    case TargetPlatform.linux:
+    case TargetPlatform.fuchsia:
+      return const Stream.empty();
+  }
+});
+
 /// Union of every discovery source. Merges USB (Android/desktop, quick_usb),
-/// ICC (iOS, ImageCaptureCore), and mDNS Wi-Fi — Wi-Fi side is still
-/// stubbed in M1.
+/// ICC (iOS, ImageCaptureCore), and mDNS Wi-Fi (bonsoir `_ptp._tcp`).
 final StreamProvider<List<DiscoveredCamera>> discoveryProvider =
     StreamProvider<List<DiscoveredCamera>>((ref) {
   final usbAsync = ref.watch(usbCameraDiscoveryProvider);
   final iccAsync = ref.watch(iccCameraDiscoveryProvider);
+  final wifiAsync = ref.watch(wifiCameraDiscoveryProvider);
   return Stream.value(<DiscoveredCamera>[
     ...usbAsync.maybeWhen(
       data: (usb) => usb.map(_usbToDiscovered),
@@ -98,13 +120,9 @@ final StreamProvider<List<DiscoveredCamera>> discoveryProvider =
       data: (icc) => icc.map(_iccToDiscovered),
       orElse: () => const <DiscoveredCamera>[],
     ),
-    // TODO(M1): replace this stub with a Bonsoir _ptp._tcp stream.
-    const DiscoveredCamera(
-      id: 'nikon-z6iii-wifi-demo',
-      name: 'Nikon Z6III (Wi-Fi 示例)',
-      channel: TransportChannel.wifi,
-      host: '192.168.1.1',
-      signalBars: 3,
+    ...wifiAsync.maybeWhen(
+      data: (wifi) => wifi.map(_wifiToDiscovered),
+      orElse: () => const <DiscoveredCamera>[],
     ),
   ]);
 });
@@ -131,6 +149,18 @@ DiscoveredCamera _iccToDiscovered(IccCameraDescriptor d) {
     channel: TransportChannel.icc,
     serialNumber: d.serialNumber,
     iccDeviceId: d.deviceId,
+  );
+}
+
+DiscoveredCamera _wifiToDiscovered(WifiCameraDescriptor d) {
+  return DiscoveredCamera(
+    id: d.id,
+    name: d.name,
+    channel: TransportChannel.wifi,
+    host: d.host,
+    // signalBars is intentionally left null — mDNS gives us no radio
+    // signal metric, only Wi-Fi framework APIs can, and requiring those
+    // permissions just for a bar count isn't worth it.
   );
 }
 

@@ -1,4 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- mDNS / NSD (bonsoir) — camera discovery on the local Wi-Fi.
+         CHANGE_WIFI_MULTICAST_STATE is required to receive multicast DNS
+         packets; without it Nikon bodies never show up. NEARBY_WIFI_DEVICES
+         is Android 13+'s replacement for coarse-location as the mDNS gate. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+
     <application
         android:label="nikon_z_control"
         android:name="${applicationName}"

@@ -47,5 +47,12 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>用于通过 USB-C 连接尼康 Z 系列相机进行遥控、参数读写、实时取景和文件传输。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于发现与本机在同一 Wi-Fi 网络下的尼康 Z 系列相机（通过 Bonjour/mDNS）。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ptp._tcp</string>
+		<string>_nikon._tcp</string>
+	</array>
 </dict>
 </plist>
