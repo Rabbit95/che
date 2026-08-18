@@ -53,6 +53,18 @@ class _LiveViewScreenState extends ConsumerState<LiveViewScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // If the active connection disappears (unplug, cable pull, app-level
+    // close), bounce back to the discovery screen so the user isn't left
+    // staring at a dead LV surface.
+    ref.listen<ActiveConnection?>(activeConnectionProvider, (prev, next) {
+      if (prev != null && next == null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('相机已断开')),
+        );
+        context.go(AppRoute.discovery);
+      }
+    });
+
     final active = ref.watch(activeConnectionProvider);
     final commands = ref.watch(cameraCommandsProvider);
     final propsSnapshot =

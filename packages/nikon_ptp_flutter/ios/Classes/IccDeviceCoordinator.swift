@@ -299,8 +299,20 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   // --- ICDeviceDelegate required ---
 
   func didRemove(_ device: ICDevice) {
-    // Browser delegate already handles cache eviction + session cleanup.
-    // Nothing to do here beyond satisfying the protocol requirement.
+    // Belt-and-braces: on iOS, only ONE of `ICDeviceBrowserDelegate.
+    // deviceBrowser(_:didRemove:moreGoing:)` and `ICDeviceDelegate.
+    // didRemove(_:)` reliably fires when a camera is unplugged mid-session,
+    // and which one depends on SDK version. Handle both, idempotently.
+    let deviceId = idFor(device)
+    let wasActive = (activeDeviceId == deviceId)
+    devicesById.removeValue(forKey: deviceId)
+    if wasActive {
+      activeDevice = nil
+      activeDeviceId = nil
+      flutterApi.onSessionEnded(
+        deviceId: deviceId, reason: "unplug") { _ in }
+    }
+    flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
   }
 
   func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {

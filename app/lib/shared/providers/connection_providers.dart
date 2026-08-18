@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:nikon_ptp/nikon_ptp.dart';
@@ -143,3 +145,36 @@ final Provider<List<DiscoveredCamera>> recentCamerasProvider =
 /// Currently connected camera + client, or null when disconnected.
 final StateProvider<ActiveConnection?> activeConnectionProvider =
     StateProvider<ActiveConnection?>((ref) => null);
+
+/// Side-effect provider that keeps `activeConnectionProvider` honest.
+///
+/// When a session becomes active it subscribes to the transport's state
+/// changes and, on `failed` or `closed`, wipes the active connection.
+/// Screens that watch [activeConnectionProvider] can then react — the
+/// LiveView screen bounces back to Discovery, the app-wide status chip
+/// clears, etc.
+///
+/// Watch this once at the app root so its subscription lives for the
+/// process lifetime.
+final Provider<void> transportDisconnectWatcherProvider = Provider<void>((ref) {
+  StreamSubscription<TransportState>? sub;
+  ref.onDispose(() => sub?.cancel());
+
+  ref.listen<ActiveConnection?>(activeConnectionProvider, (prev, next) {
+    sub?.cancel();
+    sub = null;
+    if (next == null) return;
+    sub = next.client.session.transport.stateChanges.listen((state) {
+      if (state != TransportState.failed &&
+          state != TransportState.closed) {
+        return;
+      }
+      // Only clear if this connection is still the current one — a
+      // late-fired event from a stale transport must not stomp a
+      // freshly-opened session.
+      if (identical(ref.read(activeConnectionProvider), next)) {
+        ref.read(activeConnectionProvider.notifier).state = null;
+      }
+    });
+  }, fireImmediately: true);
+});
