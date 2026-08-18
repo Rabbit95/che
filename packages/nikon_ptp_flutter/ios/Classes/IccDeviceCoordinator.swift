@@ -15,6 +15,11 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   /// Snapshot of the current browser cache for `IccPtpHostApi.devices()`.
+  ///
+  /// `ICDevice.serialNumberString` and `ICDevice.isRemote` are macOS-only;
+  /// on iOS the serial only becomes known once PTP GetDeviceInfo runs, so
+  /// we surface null / false here and let the higher layers fill them in
+  /// after the session opens.
   func snapshot() -> [IccCameraInfo] {
     return devicesById.map { (deviceId, device) in
       IccCameraInfo(
@@ -22,8 +27,8 @@ final class IccDeviceCoordinator: NSObject {
         name: device.name ?? "Unknown camera",
         transportKind: transportKind(for: device),
         model: device.name,
-        serialNumber: device.serialNumberString,
-        isRemote: device.isRemote
+        serialNumber: nil,
+        isRemote: false
       )
     }
   }
