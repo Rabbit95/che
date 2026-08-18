@@ -45,5 +45,7 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>用于通过 USB-C 连接尼康 Z 系列相机进行遥控、参数读写、实时取景和文件传输。</string>
 </dict>
 </plist>

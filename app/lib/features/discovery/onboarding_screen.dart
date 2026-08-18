@@ -1,3 +1,6 @@
+import 'dart:io' show Platform;
+
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -58,6 +61,13 @@ class OnboardingScreen extends ConsumerWidget {
   }
 
   Future<void> _launchUsbConnect(BuildContext context) async {
+    // Route to platform-specific discovery. iOS uses ImageCaptureCore
+    // (ICCameraDevice) which is a completely different stack from the
+    // quick_usb-based path used on Android/desktop.
+    if (!kIsWeb && Platform.isIOS) {
+      await _launchIccConnect(context);
+      return;
+    }
     // One-shot scan to prefill the ConnectingScreen with a specific device
     // serial when possible — otherwise ConnectingScreen picks the first
     // Nikon it sees.
@@ -92,6 +102,41 @@ class OnboardingScreen extends ConsumerWidget {
         'name': target.modelName,
         'channel': 'usb',
         'usbSerial': target.identifier,
+      },
+    );
+  }
+
+  Future<void> _launchIccConnect(BuildContext context) async {
+    List<IccCameraDescriptor> cams;
+    try {
+      cams = await IccCameraDiscovery().scanOnce();
+    } on Object catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('USB 不可用: $e')),
+      );
+      return;
+    }
+    if (!context.mounted) return;
+    if (cams.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            '未检测到 USB 相机。请用 USB-C 数据线连接，'
+            '相机开机后把 USB 模式设为 PTP，'
+            '首次连接需在系统弹窗里允许"有线配件"权限。',
+          ),
+        ),
+      );
+      return;
+    }
+    final target = cams.first;
+    context.pushNamed(
+      'connecting',
+      queryParameters: {
+        'name': target.modelName,
+        'channel': 'icc',
+        'iccDeviceId': target.deviceId,
       },
     );
   }

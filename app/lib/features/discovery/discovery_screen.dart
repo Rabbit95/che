@@ -136,6 +136,8 @@ class _CameraCard extends StatelessWidget {
                   if (camera.host != null) 'host': camera.host!,
                   if (camera.host != null) 'ssid': camera.host!,
                   if (camera.usbSerial != null) 'usbSerial': camera.usbSerial!,
+                  if (camera.iccDeviceId != null)
+                    'iccDeviceId': camera.iccDeviceId!,
                 },
               ),
       child: Container(

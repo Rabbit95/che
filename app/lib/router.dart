@@ -54,6 +54,7 @@ final Provider<GoRouter> appRouterProvider = Provider<GoRouter>((ref) {
             ssid: q['ssid'] ?? '',
             channel: channel,
             usbSerial: q['usbSerial'],
+            iccDeviceId: q['iccDeviceId'],
           );
         },
       ),

@@ -20,6 +20,7 @@ class ConnectingScreen extends ConsumerStatefulWidget {
     required this.ssid,
     this.channel = TransportChannel.wifi,
     this.usbSerial,
+    this.iccDeviceId,
     super.key,
   });
 
@@ -30,6 +31,10 @@ class ConnectingScreen extends ConsumerStatefulWidget {
 
   /// USB serial for scoping when multiple cameras are plugged in.
   final String? usbSerial;
+
+  /// iOS ICA persistent device id — required when [channel] is
+  /// [TransportChannel.icc].
+  final String? iccDeviceId;
 
   @override
   ConsumerState<ConnectingScreen> createState() => _ConnectingScreenState();
@@ -71,9 +76,13 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
           host: widget.host,
           friendlyName: 'Nikon Z Control · ${widget.host}',
         ),
-      TransportChannel.usb || TransportChannel.icc => controller.connectUsb(
+      TransportChannel.usb => controller.connectUsb(
           usbSerial: widget.usbSerial,
           friendlyName: 'Nikon Z Control · USB',
+        ),
+      TransportChannel.icc => controller.connectIcc(
+          iccDeviceId: widget.iccDeviceId ?? '',
+          friendlyName: 'Nikon Z Control · USB-C',
         ),
     };
     _sub = stream.listen(_onEvent);
@@ -93,7 +102,11 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
   }
 
   void _handleReady(ConnectionReady ready) {
-    final channelPrefix = widget.channel == TransportChannel.usb ? 'usb' : 'wifi';
+    final channelPrefix = switch (widget.channel) {
+      TransportChannel.wifi => 'wifi',
+      TransportChannel.usb => 'usb',
+      TransportChannel.icc => 'icc',
+    };
     ref.read(activeConnectionProvider.notifier).state = ActiveConnection(
       camera: DiscoveredCamera(
         id: '$channelPrefix-${ready.deviceInfo.serialNumber}',

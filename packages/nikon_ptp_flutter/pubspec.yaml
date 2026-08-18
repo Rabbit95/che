@@ -21,15 +21,13 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   lints: ^5.1.0
+  pigeon: ^22.4.2
 
-# NOTE: not declared as a `flutter.plugin` yet — current transports are pure
-# Dart (Wi-Fi Socket) or throwing stubs. When M6 wires the Android USB
-# (flutter_quick_usb) and iOS ImageCapture channels, add:
-#
-# flutter:
-#   plugin:
-#     platforms:
-#       android: { pluginClass: NikonPtpFlutterPlugin, package: com.rabbit.nikon_ptp_flutter }
-#       ios:     { pluginClass: NikonPtpFlutterPlugin }
-#
-# ...and create the corresponding Kotlin + Swift files.
+# M6b — iOS ImageCaptureCore (ICCameraDevice) bridge. Android USB stays pure-Dart
+# (goes through quick_usb_patched, no platform-channel needed at this layer).
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: IccPtpPlugin
+        sharedDarwinSource: false

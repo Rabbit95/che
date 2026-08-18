@@ -6,6 +6,7 @@
 library;
 
 export 'src/client_guid_store.dart';
+export 'src/icc_discovery.dart';
 export 'src/icc_transport.dart';
 export 'src/nikon_usb_ids.dart';
 export 'src/ptpip_transport.dart';

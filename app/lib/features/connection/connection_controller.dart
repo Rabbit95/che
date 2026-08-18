@@ -70,9 +70,7 @@ class ConnectionController {
     return switch (channel) {
       TransportChannel.wifi => PtpIpTransport(),
       TransportChannel.usb => UsbTransport(),
-      TransportChannel.icc => throw UnimplementedError(
-          'iOS ImageCapture transport not yet implemented (M6)',
-        ),
+      TransportChannel.icc => IccTransport(),
     };
   }
 
@@ -121,6 +119,27 @@ class ConnectionController {
         ),
         handshakeCompleteMessage: 'PTP-USB 接口已就绪',
         handshakeTag: 'USB',
+      );
+
+  /// iOS ImageCaptureCore handshake — [iccDeviceId] is the
+  /// `ICDevice.persistentIDString` from [IccCameraDiscovery].
+  Stream<ConnectionEvent> connectIcc({
+    required String iccDeviceId,
+    String friendlyName = 'Nikon Z Control',
+  }) =>
+      _runHandshake(
+        transportChannel: TransportChannel.icc,
+        config: TransportConfig.icc(
+          iccDeviceId: iccDeviceId,
+          friendlyName: friendlyName,
+        ),
+        initialLog: const ConnectionLog(
+          tag: 'ICC',
+          text: 'requestOpenSession（ImageCaptureCore）',
+          level: ConnectionLogLevel.active,
+        ),
+        handshakeCompleteMessage: 'ICA 会话已建立',
+        handshakeTag: 'ICC',
       );
 
   Stream<ConnectionEvent> _runHandshake({
