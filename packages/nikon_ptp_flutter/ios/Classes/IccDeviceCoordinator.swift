@@ -386,7 +386,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
 
   func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
 
-  func deviceDidBecomeReadyWithCompleteContentCatalog(_ device: ICCameraDevice)
+  func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice)
   {}
 
   func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
