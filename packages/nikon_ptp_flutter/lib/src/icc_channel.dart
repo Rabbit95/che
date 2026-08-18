@@ -23,6 +23,18 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     return created;
   }
 
+  /// Drop the cached singleton and clear any registered listeners.
+  ///
+  /// Intended for tests that want to verify behaviour across a fresh
+  /// channel. Do not call from production code — the pigeon `setUp` call
+  /// in `instance` is idempotent per binaryMessenger but not free.
+  static void resetForTesting() {
+    _cached?._browserListeners.clear();
+    _cached?._ptpEventListener = null;
+    _cached?._sessionEndedListener = null;
+    _cached = null;
+  }
+
   // Browser watchers — many can be active at once (multiple UI widgets).
   final List<Future<void> Function()> _browserListeners = [];
 

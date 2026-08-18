@@ -5,6 +5,20 @@ import ImageCaptureCore
 /// Flutter plugin entry point. Registers the pigeon `IccPtpHostApi` and
 /// holds a single long-lived `IccDeviceCoordinator` that owns the
 /// `ICDeviceBrowser` and any currently-open `ICCameraDevice` session.
+///
+/// iOS 18+ notes:
+///
+/// - **Wired Accessories permission**: first time a camera is plugged in
+///   the system prompts "允许有线配件". Denying it means `ICDeviceBrowser`
+///   never fires `didAdd`, so from Dart the discovery list stays empty
+///   with no error. Recovery is user-side: 设置 → 隐私与安全 → 有线配件.
+///   We deliberately do NOT call the newer
+///   `requestControlAuthorization` API — it is iOS 18-only and the
+///   system dialog already appears without it on plug-in.
+/// - **`ICCameraDevice.mediaFiles`**: known-broken on iPadOS 13.4+ and
+///   iOS 18+ (returns empty even when files exist — rdar://FB7593726).
+///   We never touch it; browsing goes through PTP `GetObjectHandles`
+///   over `requestSendPTPCommand`, which is unaffected.
 public class IccPtpPlugin: NSObject, FlutterPlugin {
   private let coordinator: IccDeviceCoordinator
 
