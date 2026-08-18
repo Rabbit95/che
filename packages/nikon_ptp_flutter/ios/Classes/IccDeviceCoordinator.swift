@@ -1,5 +1,6 @@
-import Foundation
+import CoreGraphics
 import Flutter
+import Foundation
 import ImageCaptureCore
 
 /// Owns the `ICDeviceBrowser` and the currently-active `ICCameraDevice`
@@ -326,7 +327,14 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     }
   }
 
-  // --- ICCameraDeviceDelegate: PTP event push ---
+  // --- ICDeviceDelegate optional but declared required in Swift bridge ---
+
+  func device(_ device: ICDevice, didEncounterError error: Error?) {
+    // Non-fatal error notification — we surface fatal ones via
+    // pendingOpen/CloseCompletion + PTP responseCode.
+  }
+
+  // --- ICCameraDeviceDelegate: PTP event push (the reason we're here) ---
 
   func cameraDevice(
     _ camera: ICCameraDevice,
@@ -339,4 +347,49 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       params: params
     ) { _ in }
   }
+
+  // --- ICCameraDeviceDelegate: other required methods (no-op stubs) ---
+  //
+  // ImageCaptureCore's Swift bridge treats several nominally-optional
+  // methods as required (Xcode's Fix-It auto-inserts them). We control
+  // the camera through raw PTP over `requestSendPTPCommand`, so the
+  // media-catalog callbacks below carry no information we act on.
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didAdd items: [ICCameraItem]
+  ) {}
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didRemove items: [ICCameraItem]
+  ) {}
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didReceiveThumbnail thumbnail: CGImage?,
+    for item: ICCameraItem,
+    error: Error?
+  ) {}
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didReceiveMetadata metadata: [AnyHashable: Any]?,
+    for item: ICCameraItem,
+    error: Error?
+  ) {}
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didRenameItems items: [ICCameraItem]
+  ) {}
+
+  func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
+
+  func deviceDidBecomeReadyWithCompleteContentCatalog(_ device: ICCameraDevice)
+  {}
+
+  func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
+
+  func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {}
 }
