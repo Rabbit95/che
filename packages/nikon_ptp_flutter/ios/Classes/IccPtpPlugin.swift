@@ -8,6 +8,14 @@ import ImageCaptureCore
 public class IccPtpPlugin: NSObject, FlutterPlugin {
   private let coordinator: IccDeviceCoordinator
 
+  // PTP opcodes intercepted before hitting ImageCaptureCore. ICA manages
+  // the session lifecycle itself (requestOpenSession / requestCloseSession)
+  // so we never let PtpSession's own OpenSession/CloseSession commands
+  // reach `requestSendPTPCommand` — they'd double-trigger and 0x201E out.
+  private static let ptpOpenSessionOpcode: Int64 = 0x1002
+  private static let ptpCloseSessionOpcode: Int64 = 0x1003
+  private static let ptpResponseOk: Int64 = 0x2001
+
   init(binaryMessenger: FlutterBinaryMessenger) {
     let flutterApi = IccPtpFlutterApi(binaryMessenger: binaryMessenger)
     self.coordinator = IccDeviceCoordinator(flutterApi: flutterApi)
@@ -30,28 +38,37 @@ extension IccPtpPlugin: IccPtpHostApi {
     deviceId: String,
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
-    // Phase B/C — will call coordinator.openSession(deviceId:completion:).
-    completion(.failure(PigeonError(
-      code: "unimplemented",
-      message: "openSession lands in Phase C",
-      details: nil
-    )))
+    coordinator.openSession(deviceId: deviceId, completion: completion)
   }
 
   func sendCommand(
     command: PtpCommand,
     completion: @escaping (Result<PtpCommandResult, Error>) -> Void
   ) {
-    // Phase C — will marshal command to ICCameraDevice.requestSendPTPCommand.
-    completion(.failure(PigeonError(
-      code: "unimplemented",
-      message: "sendCommand lands in Phase C",
-      details: nil
-    )))
+    // ImageCaptureCore already opened the ICA session in openSession;
+    // the PTP session is implicit. Absorb Dart-side OpenSession/CloseSession
+    // and reply with a synthetic OK so PtpSession's handshake completes.
+    if command.opcode == Self.ptpOpenSessionOpcode
+      || command.opcode == Self.ptpCloseSessionOpcode
+    {
+      completion(.success(PtpCommandResult(
+        responseCode: Self.ptpResponseOk,
+        responseParams: [],
+        data: nil
+      )))
+      return
+    }
+
+    coordinator.sendPtpCommand(
+      opcode: command.opcode,
+      txId: command.transactionId,
+      params: command.params,
+      outData: command.outData?.data,
+      completion: completion
+    )
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
-    // Phase C — will call coordinator.closeSession(...).
-    completion(.success(()))
+    coordinator.closeSession(completion: completion)
   }
 }
