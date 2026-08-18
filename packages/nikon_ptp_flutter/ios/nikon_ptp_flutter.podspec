@@ -13,7 +13,7 @@ app can talk PTP to a USB-C connected Nikon Z body without MFi certification.
   s.source_files     = 'Classes/**/*.{swift,h,m}'
   s.dependency 'Flutter'
   s.frameworks       = 'ImageCaptureCore'
-  s.platform         = :ios, '13.2'
+  s.platform         = :ios, '15.2'
   s.swift_version    = '5.0'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',

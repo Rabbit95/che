@@ -57,11 +57,13 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   /// Stable id for both browser-callback map keys and Dart-side references.
-  /// `persistentIDString` is preferred (survives replug), falling back to
-  /// an ephemeral UUID if the device somehow lacks one.
+  ///
+  /// `ICDevice.persistentIDString` is macOS-only, so on iOS we identify by
+  /// the ObjectIdentifier of the instance. This is stable for the browser's
+  /// lifetime — replugging yields a new ICDevice with a new id, which is
+  /// what we want (didRemove/didAdd fire anyway).
   private func idFor(_ device: ICDevice) -> String {
-    if let pid = device.persistentIDString, !pid.isEmpty { return pid }
-    return UUID().uuidString
+    return "icc-\(String(UInt(bitPattern: ObjectIdentifier(device).hashValue), radix: 16))"
   }
 }
 
