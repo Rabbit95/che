@@ -206,6 +206,26 @@ final class IccDeviceCoordinator: NSObject {
     }
   }
 
+  /// Parse an event container. Same layout as command/response.
+  /// Returns (eventCode, transactionId, params).
+  private func parseEventBlock(_ block: Data) -> (UInt16, UInt32, [Int64]) {
+    guard block.count >= 12 else { return (0, 0, []) }
+    return block.withUnsafeBytes { raw -> (UInt16, UInt32, [Int64]) in
+      let u16 = raw.bindMemory(to: UInt16.self)
+      let u32 = raw.bindMemory(to: UInt32.self)
+      let totalLen = Int(u32[0])
+      let eventCode = u16[3]
+      let txId = u32[2]
+      let paramCount = max(0, (totalLen - 12) / 4)
+      var params: [Int64] = []
+      params.reserveCapacity(paramCount)
+      for i in 0..<paramCount {
+        params.append(Int64(u32[3 + i]))
+      }
+      return (eventCode, txId, params)
+    }
+  }
+
   // MARK: - PTP command callback
 
   @objc private func didSendPTPCommand(
@@ -272,9 +292,11 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
   }
 }
 
-// MARK: - ICDeviceDelegate (required)
+// MARK: - ICCameraDeviceDelegate (extends ICDeviceDelegate)
 
-extension IccDeviceCoordinator: ICDeviceDelegate {
+extension IccDeviceCoordinator: ICCameraDeviceDelegate {
+  // --- ICDeviceDelegate required ---
+
   func didRemove(_ device: ICDevice) {
     // Browser delegate already handles cache eviction + session cleanup.
     // Nothing to do here beyond satisfying the protocol requirement.
@@ -302,5 +324,19 @@ extension IccDeviceCoordinator: ICDeviceDelegate {
     } else {
       completion(.success(()))
     }
+  }
+
+  // --- ICCameraDeviceDelegate: PTP event push ---
+
+  func cameraDevice(
+    _ camera: ICCameraDevice,
+    didReceivePTPEvent eventData: Data
+  ) {
+    let (code, txId, params) = parseEventBlock(eventData)
+    flutterApi.onPtpEvent(
+      eventCode: Int64(code),
+      transactionId: Int64(txId),
+      params: params
+    ) { _ in }
   }
 }

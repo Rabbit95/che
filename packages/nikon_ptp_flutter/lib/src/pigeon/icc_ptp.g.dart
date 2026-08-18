@@ -325,7 +325,9 @@ abstract class IccPtpFlutterApi {
   void onDeviceRemoved(String deviceId);
 
   /// Push-based PTP event from `ICCameraDeviceDelegate.didReceivePTPEvent:`.
-  void onPtpEvent(int eventCode, List<int> params);
+  /// [transactionId] is the container's transaction id (usually 0 for
+  /// asynchronous events unrelated to a specific request).
+  void onPtpEvent(int eventCode, int transactionId, List<int> params);
 
   /// The active session ended for a reason other than an explicit close —
   /// device unplugged, camera powered off, or an internal ICA error.
@@ -399,11 +401,14 @@ abstract class IccPtpFlutterApi {
           final int? arg_eventCode = (args[0] as int?);
           assert(arg_eventCode != null,
               'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onPtpEvent was null, expected non-null int.');
-          final List<int>? arg_params = (args[1] as List<Object?>?)?.cast<int>();
+          final int? arg_transactionId = (args[1] as int?);
+          assert(arg_transactionId != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onPtpEvent was null, expected non-null int.');
+          final List<int>? arg_params = (args[2] as List<Object?>?)?.cast<int>();
           assert(arg_params != null,
               'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onPtpEvent was null, expected non-null List<int>.');
           try {
-            api.onPtpEvent(arg_eventCode!, arg_params!);
+            api.onPtpEvent(arg_eventCode!, arg_transactionId!, arg_params!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

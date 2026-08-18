@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:nikon_ptp/nikon_ptp.dart';
 
+import 'icc_channel.dart';
 import 'pigeon/icc_ptp.g.dart';
 
 /// iOS ICCameraDevice transport (iPhone USB-C + iPad USB-C/Lightning).
@@ -58,9 +59,14 @@ final class IccTransport implements Transport {
       );
     }
     _setState(TransportState.connecting);
+    // Subscribe to native push channel BEFORE opening the session so we
+    // don't miss a stray event fired during the window.
+    IccPtpChannel.instance.setPtpEventListener(_onPtpEvent);
+    IccPtpChannel.instance.setSessionEndedListener(_onSessionEnded);
     try {
       final ok = await _api.openSession(deviceId);
       if (!ok) {
+        _detachChannel();
         _setState(TransportState.failed);
         throw const PtpTransportException(
           'ICCameraDevice.requestOpenSession returned false',
@@ -69,11 +75,39 @@ final class IccTransport implements Transport {
       _iccDeviceId = deviceId;
       _setState(TransportState.ready);
     } on PlatformException catch (e) {
+      _detachChannel();
       _setState(TransportState.failed);
       throw PtpTransportException(
         'ICA openSession failed: ${e.message ?? e.code}',
       );
     }
+  }
+
+  void _onPtpEvent(int eventCode, int transactionId, List<int> params) {
+    if (_events.isClosed) return;
+    _events.add(CameraEvent(
+      code: eventCode,
+      transactionId: transactionId,
+      p1: params.isNotEmpty ? params[0] : 0,
+      p2: params.length > 1 ? params[1] : 0,
+      p3: params.length > 2 ? params[2] : 0,
+    ));
+  }
+
+  void _onSessionEnded(String deviceId, String reason) {
+    // Only react to events for our device — a listener from a stale
+    // transport shouldn't hijack a fresh session.
+    if (_iccDeviceId != null && deviceId != _iccDeviceId) return;
+    if (_state == TransportState.closed) return;
+    _detachChannel();
+    _setState(TransportState.failed);
+  }
+
+  /// Detach this transport from the shared channel. Safe to call
+  /// repeatedly; only clears if the current listener is ours.
+  void _detachChannel() {
+    IccPtpChannel.instance.setPtpEventListener(null);
+    IccPtpChannel.instance.setSessionEndedListener(null);
   }
 
   @override
@@ -142,6 +176,7 @@ final class IccTransport implements Transport {
   Future<void> close() async {
     if (_state == TransportState.closed) return;
     _setState(TransportState.closing);
+    _detachChannel();
     try {
       await _api.closeSession();
     } on PlatformException {

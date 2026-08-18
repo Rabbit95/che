@@ -117,7 +117,9 @@ abstract class IccPtpFlutterApi {
   void onDeviceRemoved(String deviceId);
 
   /// Push-based PTP event from `ICCameraDeviceDelegate.didReceivePTPEvent:`.
-  void onPtpEvent(int eventCode, List<int> params);
+  /// [transactionId] is the container's transaction id (usually 0 for
+  /// asynchronous events unrelated to a specific request).
+  void onPtpEvent(int eventCode, int transactionId, List<int> params);
 
   /// The active session ended for a reason other than an explicit close —
   /// device unplugged, camera powered off, or an internal ICA error.

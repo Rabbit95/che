@@ -334,7 +334,9 @@ protocol IccPtpFlutterApiProtocol {
   /// A device disappeared (unplug / turned off).
   func onDeviceRemoved(deviceId deviceIdArg: String, completion: @escaping (Result<Void, PigeonError>) -> Void)
   /// Push-based PTP event from `ICCameraDeviceDelegate.didReceivePTPEvent:`.
-  func onPtpEvent(eventCode eventCodeArg: Int64, params paramsArg: [Int64], completion: @escaping (Result<Void, PigeonError>) -> Void)
+  /// [transactionId] is the container's transaction id (usually 0 for
+  /// asynchronous events unrelated to a specific request).
+  func onPtpEvent(eventCode eventCodeArg: Int64, transactionId transactionIdArg: Int64, params paramsArg: [Int64], completion: @escaping (Result<Void, PigeonError>) -> Void)
   /// The active session ended for a reason other than an explicit close —
   /// device unplugged, camera powered off, or an internal ICA error.
   ///
@@ -390,10 +392,12 @@ class IccPtpFlutterApi: IccPtpFlutterApiProtocol {
     }
   }
   /// Push-based PTP event from `ICCameraDeviceDelegate.didReceivePTPEvent:`.
-  func onPtpEvent(eventCode eventCodeArg: Int64, params paramsArg: [Int64], completion: @escaping (Result<Void, PigeonError>) -> Void) {
+  /// [transactionId] is the container's transaction id (usually 0 for
+  /// asynchronous events unrelated to a specific request).
+  func onPtpEvent(eventCode eventCodeArg: Int64, transactionId transactionIdArg: Int64, params paramsArg: [Int64], completion: @escaping (Result<Void, PigeonError>) -> Void) {
     let channelName: String = "dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onPtpEvent\(messageChannelSuffix)"
     let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
-    channel.sendMessage([eventCodeArg, paramsArg] as [Any?]) { response in
+    channel.sendMessage([eventCodeArg, transactionIdArg, paramsArg] as [Any?]) { response in
       guard let listResponse = response as? [Any?] else {
         completion(.failure(createConnectionError(withChannelName: channelName)))
         return
