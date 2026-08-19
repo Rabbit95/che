@@ -140,12 +140,15 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
       deviceInfo: ready.deviceInfo,
       client: ready.client,
     );
-    // Small delay so the READY log line has a chance to render before the
-    // route transition; feels less abrupt than an immediate hop.
-    Future<void>.delayed(const Duration(milliseconds: 500), () {
-      if (!mounted) return;
-      context.go(AppRoute.liveView);
-    });
+    // NOTE: intentionally NO auto-navigation to Live View — Phase A wants
+    // the user to be able to copy the connect log after a slow success,
+    // which is impossible if the screen bounces to LV automatically.
+    // The "进入实时取景" primary button in `_ActionButtons` drives the
+    // navigation when the user is done inspecting the log.
+  }
+
+  void _enterLiveView() {
+    context.go(AppRoute.liveView);
   }
 
   void _retry() {
@@ -170,9 +173,11 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
           onPressed: _abortAndPop,
         ),
         title: Text(
-          failed == null
-              ? '正在连接 ${widget.cameraName}'
-              : '连接失败 · ${widget.cameraName}',
+          failed != null
+              ? '连接失败 · ${widget.cameraName}'
+              : _succeeded
+                  ? '已连接 · ${widget.cameraName}'
+                  : '正在连接 ${widget.cameraName}',
           style: const TextStyle(fontSize: 15),
         ),
         centerTitle: true,
@@ -198,8 +203,10 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
             const SizedBox(height: 20),
             _ActionButtons(
               failed: failed != null,
+              succeeded: _succeeded,
               onCancel: _abortAndPop,
               onRetry: _retry,
+              onEnterLiveView: _enterLiveView,
             ),
             const Spacer(),
           ],
@@ -212,16 +219,45 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
 class _ActionButtons extends StatelessWidget {
   const _ActionButtons({
     required this.failed,
+    required this.succeeded,
     required this.onCancel,
     required this.onRetry,
+    required this.onEnterLiveView,
   });
 
   final bool failed;
+  final bool succeeded;
   final VoidCallback onCancel;
   final VoidCallback onRetry;
+  final VoidCallback onEnterLiveView;
 
   @override
   Widget build(BuildContext context) {
+    if (succeeded) {
+      // Do NOT auto-navigate: users need to be able to copy the connect
+      // log after a slow success too. Ghost "返回" preserves the escape
+      // hatch; primary "进入实时取景" is the happy path.
+      return Row(
+        children: [
+          Expanded(
+            child: PillButton(
+              label: '返回列表',
+              variant: PillButtonVariant.ghost,
+              expand: true,
+              onPressed: onCancel,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: PillButton(
+              label: '进入实时取景',
+              expand: true,
+              onPressed: onEnterLiveView,
+            ),
+          ),
+        ],
+      );
+    }
     if (!failed) {
       return PillButton(
         label: '取消',
