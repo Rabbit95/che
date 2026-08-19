@@ -362,6 +362,17 @@ protocol IccPtpFlutterApiProtocol {
   /// [elapsedMs] is measured from the start of the pending
   /// `openSession` call on the Swift side.
   func onSessionOpenProgress(deviceId deviceIdArg: String, phase phaseArg: String, percent percentArg: Int64, elapsedMs elapsedMsArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void)
+  /// Structured diagnostic log line from the Swift coordinator, mirrored
+  /// alongside `os.Logger`. Consumed by the in-app "copy logs" panel so
+  /// users without a Mac (i.e. anyone running the shipped IPA who does
+  /// not own macOS Console.app) can still hand us the Swift-side trace.
+  ///
+  /// [tag] is a short kebab-case slug like `browser.didAdd`,
+  /// `openSession.requestOpenSession`, `catalog.progress`,
+  /// `command.request`. [message] is the same string that landed in
+  /// `os_log`. [elapsedMs] is `-1` when the event is not tied to a
+  /// pending open (e.g. plain browser churn).
+  func onDiagnosticLog(tag tagArg: String, message messageArg: String, elapsedMs elapsedMsArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void)
 }
 class IccPtpFlutterApi: IccPtpFlutterApiProtocol {
   private let binaryMessenger: FlutterBinaryMessenger
@@ -477,6 +488,34 @@ class IccPtpFlutterApi: IccPtpFlutterApiProtocol {
     let channelName: String = "dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress\(messageChannelSuffix)"
     let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
     channel.sendMessage([deviceIdArg, phaseArg, percentArg, elapsedMsArg] as [Any?]) { response in
+      guard let listResponse = response as? [Any?] else {
+        completion(.failure(createConnectionError(withChannelName: channelName)))
+        return
+      }
+      if listResponse.count > 1 {
+        let code: String = listResponse[0] as! String
+        let message: String? = nilOrValue(listResponse[1])
+        let details: String? = nilOrValue(listResponse[2])
+        completion(.failure(PigeonError(code: code, message: message, details: details)))
+      } else {
+        completion(.success(Void()))
+      }
+    }
+  }
+  /// Structured diagnostic log line from the Swift coordinator, mirrored
+  /// alongside `os.Logger`. Consumed by the in-app "copy logs" panel so
+  /// users without a Mac (i.e. anyone running the shipped IPA who does
+  /// not own macOS Console.app) can still hand us the Swift-side trace.
+  ///
+  /// [tag] is a short kebab-case slug like `browser.didAdd`,
+  /// `openSession.requestOpenSession`, `catalog.progress`,
+  /// `command.request`. [message] is the same string that landed in
+  /// `os_log`. [elapsedMs] is `-1` when the event is not tied to a
+  /// pending open (e.g. plain browser churn).
+  func onDiagnosticLog(tag tagArg: String, message messageArg: String, elapsedMs elapsedMsArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    let channelName: String = "dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog\(messageChannelSuffix)"
+    let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
+    channel.sendMessage([tagArg, messageArg, elapsedMsArg] as [Any?]) { response in
       guard let listResponse = response as? [Any?] else {
         completion(.failure(createConnectionError(withChannelName: channelName)))
         return

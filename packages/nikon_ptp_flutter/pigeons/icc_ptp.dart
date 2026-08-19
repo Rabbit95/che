@@ -152,4 +152,16 @@ abstract class IccPtpFlutterApi {
     int percent,
     int elapsedMs,
   );
+
+  /// Structured diagnostic log line from the Swift coordinator, mirrored
+  /// alongside `os.Logger`. Consumed by the in-app "copy logs" panel so
+  /// users without a Mac (i.e. anyone running the shipped IPA who does
+  /// not own macOS Console.app) can still hand us the Swift-side trace.
+  ///
+  /// [tag] is a short kebab-case slug like `browser.didAdd`,
+  /// `openSession.requestOpenSession`, `catalog.progress`,
+  /// `command.request`. [message] is the same string that landed in
+  /// `os_log`. [elapsedMs] is `-1` when the event is not tied to a
+  /// pending open (e.g. plain browser churn).
+  void onDiagnosticLog(String tag, String message, int elapsedMs);
 }

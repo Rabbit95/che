@@ -53,10 +53,27 @@ final class NikonZClient {
   bool changeApplicationModeSkipped = false;
   int? changeApplicationModeErrorCode;
 
-  Future<DeviceInfo> connect() async {
-    await session.open();
+  /// [onPhase] is fired at each connect sub-step transition so the UI can
+  /// render per-step timing. [phase] is one of:
+  /// `sessionOpen.start` / `sessionOpen.done` /
+  /// `getDeviceInfo.start` / `getDeviceInfo.done` /
+  /// `changeApplicationMode.start` / `changeApplicationMode.done` /
+  /// `changeApplicationMode.skipped` /
+  /// `waitDeviceReady.start` / `waitDeviceReady.done`.
+  /// [elapsedMsSinceConnect] is measured from the start of [connect].
+  Future<DeviceInfo> connect({
+    void Function(String phase, int elapsedMsSinceConnect)? onPhase,
+  }) async {
+    final sw = Stopwatch()..start();
+    void phase(String name) => onPhase?.call(name, sw.elapsedMilliseconds);
 
+    phase('sessionOpen.start');
+    await session.open();
+    phase('sessionOpen.done');
+
+    phase('getDeviceInfo.start');
     final info = await getDeviceInfo();
+    phase('getDeviceInfo.done');
     _deviceInfo = info;
 
     final model = NikonZModel.fromModelString(info.model);
@@ -65,8 +82,12 @@ final class NikonZClient {
     if (_quirks!.needsChangeApplicationMode &&
         info.supportsOperation(NikonOpcode.changeApplicationMode)) {
       try {
+        phase('changeApplicationMode.start');
         await _changeApplicationMode(1);
+        phase('changeApplicationMode.done');
+        phase('waitDeviceReady.start');
         await _waitDeviceReady();
+        phase('waitDeviceReady.done');
       } on PtpResponseException catch (e) {
         // These non-fatal codes mean "you're not allowed to elevate to
         // controller mode" — usually because the camera is in a
@@ -83,6 +104,7 @@ final class NikonZClient {
         if (tolerable.contains(e.code)) {
           changeApplicationModeSkipped = true;
           changeApplicationModeErrorCode = e.code;
+          phase('changeApplicationMode.skipped');
         } else {
           rethrow;
         }

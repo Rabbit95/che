@@ -33,6 +33,26 @@ final class IccOpenProgress {
   final int elapsedMs;
 }
 
+/// A structured log line mirrored from the Swift coordinator's `os.Logger`.
+/// Delivered through [IccTransport.diagnosticLogs] so the in-app "copy
+/// logs" panel can surface Swift-side detail on hosts without Console.app.
+@immutable
+final class IccDiagnosticLog {
+  const IccDiagnosticLog({
+    required this.tag,
+    required this.message,
+    required this.elapsedMs,
+  });
+
+  /// Short kebab-case slug — see `IccPtpFlutterApi.onDiagnosticLog` docs.
+  final String tag;
+  final String message;
+
+  /// Milliseconds since the pending `openSession` started, or `-1` when
+  /// the event is not tied to one.
+  final int elapsedMs;
+}
+
 /// iOS ICCameraDevice transport (iPhone USB-C + iPad USB-C/Lightning).
 ///
 /// Bridges the pure-Dart [Transport] contract to Apple's ImageCaptureCore
@@ -66,6 +86,8 @@ final class IccTransport implements Transport {
       StreamController<TransportState>.broadcast();
   final StreamController<IccOpenProgress> _progress =
       StreamController<IccOpenProgress>.broadcast();
+  final StreamController<IccDiagnosticLog> _diagnostics =
+      StreamController<IccDiagnosticLog>.broadcast();
 
   TransportState _state = TransportState.idle;
   int _nextTxId = 1;
@@ -89,6 +111,11 @@ final class IccTransport implements Transport {
   /// [TransportChannel.icc].
   Stream<IccOpenProgress> get openProgress => _progress.stream;
 
+  /// Every structured log line the Swift coordinator emits, mirrored
+  /// alongside its `os.Logger`. Non-contract — the connect UI subscribes
+  /// so the in-app "copy logs" panel can surface Swift-side detail.
+  Stream<IccDiagnosticLog> get diagnosticLogs => _diagnostics.stream;
+
   void _setState(TransportState next) {
     if (_state == next) return;
     _state = next;
@@ -110,6 +137,7 @@ final class IccTransport implements Transport {
     IccPtpChannel.instance.setPtpEventListener(_onPtpEvent);
     IccPtpChannel.instance.setSessionEndedListener(_onSessionEnded);
     IccPtpChannel.instance.setSessionOpenProgressListener(_onOpenProgress);
+    IccPtpChannel.instance.setDiagnosticLogListener(_onDiagnosticLog);
     try {
       final ok = await _api.openSession(deviceId).timeout(
         _openTimeout,
@@ -180,12 +208,24 @@ final class IccTransport implements Transport {
     ));
   }
 
+  void _onDiagnosticLog(String tag, String message, int elapsedMs) {
+    if (_diagnostics.isClosed) return;
+    // No device-id filter — diagnostic events include browser churn that
+    // isn't tied to any single device. The UI can filter downstream.
+    _diagnostics.add(IccDiagnosticLog(
+      tag: tag,
+      message: message,
+      elapsedMs: elapsedMs,
+    ));
+  }
+
   /// Detach this transport from the shared channel. Safe to call
   /// repeatedly; only clears if the current listener is ours.
   void _detachChannel() {
     IccPtpChannel.instance.setPtpEventListener(null);
     IccPtpChannel.instance.setSessionEndedListener(null);
     IccPtpChannel.instance.setSessionOpenProgressListener(null);
+    IccPtpChannel.instance.setDiagnosticLogListener(null);
   }
 
   @override
@@ -265,5 +305,6 @@ final class IccTransport implements Transport {
     if (!_events.isClosed) await _events.close();
     if (!_states.isClosed) await _states.close();
     if (!_progress.isClosed) await _progress.close();
+    if (!_diagnostics.isClosed) await _diagnostics.close();
   }
 }

@@ -33,6 +33,7 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     _cached?._ptpEventListener = null;
     _cached?._sessionEndedListener = null;
     _cached?._sessionOpenProgressListener = null;
+    _cached?._diagnosticLogListener = null;
     _cached = null;
   }
 
@@ -49,6 +50,8 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     int percent,
     int elapsedMs,
   )? _sessionOpenProgressListener;
+  void Function(String tag, String message, int elapsedMs)?
+      _diagnosticLogListener;
 
   void addBrowserListener(Future<void> Function() cb) {
     _browserListeners.add(cb);
@@ -81,6 +84,12 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     _sessionOpenProgressListener = cb;
   }
 
+  void setDiagnosticLogListener(
+    void Function(String tag, String message, int elapsedMs)? cb,
+  ) {
+    _diagnosticLogListener = cb;
+  }
+
   @override
   void onDeviceAdded(IccCameraInfo device) {
     _fanoutBrowser();
@@ -109,6 +118,11 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     int elapsedMs,
   ) {
     _sessionOpenProgressListener?.call(deviceId, phase, percent, elapsedMs);
+  }
+
+  @override
+  void onDiagnosticLog(String tag, String message, int elapsedMs) {
+    _diagnosticLogListener?.call(tag, message, elapsedMs);
   }
 
   Future<void> _fanoutBrowser() async {

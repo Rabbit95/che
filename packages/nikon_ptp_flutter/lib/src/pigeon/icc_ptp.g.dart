@@ -356,6 +356,18 @@ abstract class IccPtpFlutterApi {
   /// `openSession` call on the Swift side.
   void onSessionOpenProgress(String deviceId, String phase, int percent, int elapsedMs);
 
+  /// Structured diagnostic log line from the Swift coordinator, mirrored
+  /// alongside `os.Logger`. Consumed by the in-app "copy logs" panel so
+  /// users without a Mac (i.e. anyone running the shipped IPA who does
+  /// not own macOS Console.app) can still hand us the Swift-side trace.
+  ///
+  /// [tag] is a short kebab-case slug like `browser.didAdd`,
+  /// `openSession.requestOpenSession`, `catalog.progress`,
+  /// `command.request`. [message] is the same string that landed in
+  /// `os_log`. [elapsedMs] is `-1` when the event is not tied to a
+  /// pending open (e.g. plain browser churn).
+  void onDiagnosticLog(String tag, String message, int elapsedMs);
+
   static void setUp(IccPtpFlutterApi? api, {BinaryMessenger? binaryMessenger, String messageChannelSuffix = '',}) {
     messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
     {
@@ -492,6 +504,37 @@ abstract class IccPtpFlutterApi {
               'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onSessionOpenProgress was null, expected non-null int.');
           try {
             api.onSessionOpenProgress(arg_deviceId!, arg_phase!, arg_percent!, arg_elapsedMs!);
+            return wrapResponse(empty: true);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          }          catch (e) {
+            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+    {
+      final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog$messageChannelSuffix', pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          assert(message != null,
+          'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog was null.');
+          final List<Object?> args = (message as List<Object?>?)!;
+          final String? arg_tag = (args[0] as String?);
+          assert(arg_tag != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog was null, expected non-null String.');
+          final String? arg_message = (args[1] as String?);
+          assert(arg_message != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog was null, expected non-null String.');
+          final int? arg_elapsedMs = (args[2] as int?);
+          assert(arg_elapsedMs != null,
+              'Argument for dev.flutter.pigeon.nikon_ptp_flutter.IccPtpFlutterApi.onDiagnosticLog was null, expected non-null int.');
+          try {
+            api.onDiagnosticLog(arg_tag!, arg_message!, arg_elapsedMs!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

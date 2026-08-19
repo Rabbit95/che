@@ -176,6 +176,7 @@ class ConnectionController {
   }) async {
     final sw = Stopwatch()..start();
     StreamSubscription<IccOpenProgress>? iccProgressSub;
+    StreamSubscription<IccDiagnosticLog>? iccDiagnosticSub;
 
     ConnectionLog log(
       String tag,
@@ -211,6 +212,18 @@ class ConnectionController {
             elapsedMs: sw.elapsedMilliseconds,
           ));
         });
+        iccDiagnosticSub = transport.diagnosticLogs.listen((d) {
+          // Swift-side raw log — pushed straight through so users can
+          // copy the full trace out of the in-app log panel. Bucketed
+          // under the SWIFT tag so it's visually distinct from
+          // higher-level ConnectionLog rows and can be filtered later.
+          emit(ConnectionLog(
+            tag: 'SWIFT',
+            text: '${d.tag} · ${d.message}',
+            level: ConnectionLogLevel.info,
+            elapsedMs: sw.elapsedMilliseconds,
+          ));
+        });
       }
 
       try {
@@ -226,24 +239,25 @@ class ConnectionController {
         _session = session;
         final client = NikonZClient(session);
 
+        // One active row that becomes "done · Nms" as each connect sub-
+        // step finishes, so users can tell which PTP command is slow
+        // (session.open / GetDeviceInfo / ChangeApplicationMode /
+        // waitDeviceReady) instead of seeing one opaque blob.
         emit(log(
           'CTRL',
-          'OpenSession + GetDeviceInfo…',
+          'session.open (PTP OpenSession)…',
           level: ConnectionLogLevel.active,
           timed: false,
         ));
 
-        final info = await client.connect();
+        final info = await client.connect(
+          onPhase: (phase, phaseMs) =>
+              emit(_phaseLog(phase, phaseMs, sw.elapsedMilliseconds)),
+        );
         if (_cancelled) {
           await client.disconnect(sendCloseSession: false);
           return;
         }
-
-        emit(log(
-          'CTRL',
-          'ChangeApplicationMode(1) 完成',
-          level: ConnectionLogLevel.ok,
-        ));
         emit(log(
           'READY',
           '${info.model} · SN ${info.serialNumber} · ${info.deviceVersion}',
@@ -314,8 +328,60 @@ class ConnectionController {
       }
     } finally {
       await iccProgressSub?.cancel();
+      await iccDiagnosticSub?.cancel();
       if (!out.isClosed) await out.close();
     }
+  }
+
+  /// Translate a `NikonZClient.connect` phase transition into a UI log row.
+  /// [phaseMs] is elapsed since `connect()` started; [totalMs] is elapsed
+  /// since the whole handshake started (matches other rows' elapsedMs).
+  static ConnectionLog _phaseLog(String phase, int phaseMs, int totalMs) {
+    final (text, level) = switch (phase) {
+      'sessionOpen.start' => (
+        'PtpSession.open (OpenSession 0x1002)…',
+        ConnectionLogLevel.active,
+      ),
+      'sessionOpen.done' => (
+        'PtpSession.open 完成 · ${phaseMs}ms',
+        ConnectionLogLevel.ok,
+      ),
+      'getDeviceInfo.start' => (
+        'GetDeviceInfo (0x1001)…',
+        ConnectionLogLevel.active,
+      ),
+      'getDeviceInfo.done' => (
+        'GetDeviceInfo 完成 · ${phaseMs}ms',
+        ConnectionLogLevel.ok,
+      ),
+      'changeApplicationMode.start' => (
+        'ChangeApplicationMode(1) (0x9435)…',
+        ConnectionLogLevel.active,
+      ),
+      'changeApplicationMode.done' => (
+        'ChangeApplicationMode 完成 · ${phaseMs}ms',
+        ConnectionLogLevel.ok,
+      ),
+      'changeApplicationMode.skipped' => (
+        'ChangeApplicationMode 跳过（相机拒绝或不支持，继续走只读路径）',
+        ConnectionLogLevel.info,
+      ),
+      'waitDeviceReady.start' => (
+        'DeviceReady 轮询 (0x90C8)…',
+        ConnectionLogLevel.active,
+      ),
+      'waitDeviceReady.done' => (
+        'DeviceReady 完成 · ${phaseMs}ms',
+        ConnectionLogLevel.ok,
+      ),
+      _ => (phase, ConnectionLogLevel.info),
+    };
+    return ConnectionLog(
+      tag: 'CTRL',
+      text: text,
+      level: level,
+      elapsedMs: totalMs,
+    );
   }
 
   static String _timeoutTag(TransportChannel channel) => switch (channel) {

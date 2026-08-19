@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:nikon_ptp/nikon_ptp.dart';
@@ -101,6 +103,25 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
     }
   }
 
+  /// Multi-line preamble prepended to the clipboard-copied log so users
+  /// can send us a self-contained diagnostic dump without having to
+  /// re-type the device / channel / platform context.
+  String _logHeader() {
+    final channel = switch (widget.channel) {
+      TransportChannel.wifi => 'wifi',
+      TransportChannel.usb => 'usb',
+      TransportChannel.icc => 'icc',
+    };
+    return 'Nikon Z Control · 连接日志\n'
+        'camera: ${widget.cameraName}\n'
+        'channel: $channel\n'
+        'host: ${widget.host}\n'
+        'ssid: ${widget.ssid}\n'
+        'iccDeviceId: ${widget.iccDeviceId ?? "-"}\n'
+        'platform: ${Platform.operatingSystem} '
+        '${Platform.operatingSystemVersion}';
+  }
+
   void _handleReady(ConnectionReady ready) {
     final channelPrefix = switch (widget.channel) {
       TransportChannel.wifi => 'wifi',
@@ -170,7 +191,10 @@ class _ConnectingScreenState extends ConsumerState<ConnectingScreen> {
               ssid: widget.ssid,
             ),
             const SizedBox(height: 28),
-            _ConnLog(lines: _log),
+            _ConnLog(
+              lines: _log,
+              header: _logHeader(),
+            ),
             const SizedBox(height: 20),
             _ActionButtons(
               failed: failed != null,
@@ -413,8 +437,12 @@ class _ChannelSummary extends StatelessWidget {
 }
 
 class _ConnLog extends StatefulWidget {
-  const _ConnLog({required this.lines});
+  const _ConnLog({required this.lines, required this.header});
   final List<ConnectionLog> lines;
+
+  /// Extra context prepended when the user taps "复制日志" — device name,
+  /// channel, platform. Not rendered inside the panel; only in clipboard.
+  final String header;
 
   @override
   State<_ConnLog> createState() => _ConnLogState();
@@ -424,6 +452,7 @@ class _ConnLogState extends State<_ConnLog> {
   Timer? _ticker;
   Stopwatch? _activeSw;
   int _activeIndex = -1;
+  final ScrollController _scroll = ScrollController();
 
   @override
   void initState() {
@@ -435,11 +464,24 @@ class _ConnLogState extends State<_ConnLog> {
   void didUpdateWidget(covariant _ConnLog oldWidget) {
     super.didUpdateWidget(oldWidget);
     _syncActive();
+    // New line arrived — pin scroll to the tail so the user always sees
+    // the freshest log entry without having to scroll manually.
+    if (widget.lines.length != oldWidget.lines.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_scroll.hasClients) return;
+        _scroll.animateTo(
+          _scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOut,
+        );
+      });
+    }
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _scroll.dispose();
     super.dispose();
   }
 
@@ -475,8 +517,8 @@ class _ConnLogState extends State<_ConnLog> {
     final lines = widget.lines;
     final lastIdx = lines.length - 1;
     return Container(
-      constraints: const BoxConstraints(minHeight: 40),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      constraints: const BoxConstraints(minHeight: 40, maxHeight: 260),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: AppColors.surface,
         borderRadius: AppRadius.tile,
@@ -484,13 +526,98 @@ class _ConnLogState extends State<_ConnLog> {
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          for (int i = 0; i < lines.length; i++) _row(lines[i], i == lastIdx),
-          _stallHint(lastIdx >= 0 ? lines[lastIdx] : null),
+          _header(),
+          const SizedBox(height: 4),
+          Flexible(
+            child: SingleChildScrollView(
+              controller: _scroll,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (int i = 0; i < lines.length; i++)
+                    _row(lines[i], i == lastIdx),
+                  _stallHint(lastIdx >= 0 ? lines[lastIdx] : null),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
+
+  /// Top-right "📋 复制日志" affordance. Always visible so a user who's
+  /// been staring at a spinner for two minutes can send us the trace
+  /// without waiting for the connect to fail (or succeed).
+  Widget _header() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          '连接日志',
+          style: AppTypography.mono.copyWith(
+            fontSize: 10,
+            color: AppColors.text4,
+          ),
+        ),
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => _copyToClipboard(context),
+          child: Padding(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.copy_rounded,
+                  size: 12,
+                  color: AppColors.accent,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  '复制日志',
+                  style: AppTypography.mono.copyWith(
+                    fontSize: 11,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _copyToClipboard(BuildContext context) async {
+    final buf = StringBuffer()
+      ..writeln(widget.header)
+      ..writeln('=' * 40);
+    for (final l in widget.lines) {
+      final elapsed =
+          l.elapsedMs == null ? '        ' : '${l.elapsedMs}ms'.padLeft(8);
+      buf.writeln('[$elapsed] [${l.tag.padRight(6)}] '
+          '${_levelSlug(l.level)} ${l.text}');
+    }
+    await Clipboard.setData(ClipboardData(text: buf.toString()));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('日志已复制到剪贴板'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  static String _levelSlug(ConnectionLogLevel level) => switch (level) {
+        ConnectionLogLevel.active => 'ACTIVE',
+        ConnectionLogLevel.ok => 'OK    ',
+        ConnectionLogLevel.info => 'INFO  ',
+        ConnectionLogLevel.error => 'ERROR ',
+      };
 
   Widget _row(ConnectionLog l, bool isLast) {
     final color = switch (l.level) {

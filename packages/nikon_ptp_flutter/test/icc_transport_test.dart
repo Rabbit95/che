@@ -251,6 +251,33 @@ void main() {
       expect(progress[1].percent, 100);
       await sub.cancel();
     });
+
+    test('diagnosticLogs stream forwards Swift os.Logger mirror events',
+        () async {
+      await transport.open(TransportConfig.icc(iccDeviceId: 'icc-x'));
+      final diagnostics = <IccDiagnosticLog>[];
+      final sub = transport.diagnosticLogs.listen(diagnostics.add);
+
+      IccPtpChannel.instance.onDiagnosticLog(
+        'openSession.requestOpenSession', 'issued deviceId=icc-x', -1);
+      IccPtpChannel.instance.onDiagnosticLog(
+        'catalog.progress', 'deviceId=icc-x percent=42', 850);
+      IccPtpChannel.instance.onDiagnosticLog(
+        'command.response',
+        'opcode=0x1001 respCode=0x2001 elapsedMs=42 inBytes=123',
+        42,
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      expect(diagnostics, hasLength(3));
+      expect(diagnostics[0].tag, 'openSession.requestOpenSession');
+      expect(diagnostics[0].elapsedMs, -1);
+      expect(diagnostics[1].tag, 'catalog.progress');
+      expect(diagnostics[1].message, contains('percent=42'));
+      expect(diagnostics[2].tag, 'command.response');
+      expect(diagnostics[2].elapsedMs, 42);
+      await sub.cancel();
+    });
   });
 }
 

@@ -26,6 +26,30 @@ final class IccDeviceCoordinator: NSObject {
   private let browser: ICDeviceBrowser
   private var devicesById: [String: ICCameraDevice] = [:]
 
+  /// Emit a structured log line via BOTH `os.Logger` (for macOS Console
+  /// users) AND the Flutter `onDiagnosticLog` bridge (for anyone running
+  /// the IPA on a Windows / Linux host). The wire tag is the same short
+  /// slug that appears in os_log; the message carries the human-readable
+  /// detail. `error: true` bumps the os_log level and lets the Flutter
+  /// side render the row in red without parsing the message.
+  private func log(
+    _ tag: String,
+    _ message: String,
+    error: Bool = false,
+    elapsedMs: Int64 = -1
+  ) {
+    let level = error ? "err" : "info"
+    let combined = "\(level) \(tag) \(message)"
+    if error {
+      Self.log.error("\(combined, privacy: .public)")
+    } else {
+      Self.log.info("\(combined, privacy: .public)")
+    }
+    flutterApi.onDiagnosticLog(
+      tag: tag, message: message, elapsedMs: elapsedMs
+    ) { _ in }
+  }
+
   // Active session state — at most one camera has an open session at a time.
   private var activeDevice: ICCameraDevice?
   private var activeDeviceId: String?
@@ -58,7 +82,7 @@ final class IccDeviceCoordinator: NSObject {
     self.browser = ICDeviceBrowser()
     super.init()
 
-    Self.log.info("browser.init")
+    log("browser.init", "coordinator constructed")
     self.browser.delegate = self
     let mask = ICDeviceTypeMask(rawValue:
       ICDeviceTypeMask.camera.rawValue |
@@ -67,7 +91,7 @@ final class IccDeviceCoordinator: NSObject {
     if let mask = mask {
       self.browser.browsedDeviceTypeMask = mask
     }
-    Self.log.info("browser.start")
+    log("browser.start", "ICDeviceBrowser.start()")
     self.browser.start()
   }
 
@@ -89,25 +113,33 @@ final class IccDeviceCoordinator: NSObject {
     deviceId: String,
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
-    Self.log.info("openSession.request deviceId=\(deviceId, privacy: .public)")
+    log("openSession.request", "deviceId=\(deviceId)")
     guard let camera = devicesById[deviceId] else {
-      Self.log.error(
-        "openSession.reject deviceId=\(deviceId, privacy: .public) reason=not_in_cache")
+      log(
+        "openSession.reject",
+        "deviceId=\(deviceId) reason=not_in_cache",
+        error: true
+      )
       completion(.failure(iccError(code: 404,
         message: "Device \(deviceId) not in browser cache")))
       return
     }
     if camera.hasOpenSession {
-      Self.log.info(
-        "openSession.fastpath deviceId=\(deviceId, privacy: .public) reason=already_open")
+      log(
+        "openSession.fastpath",
+        "deviceId=\(deviceId) reason=already_open"
+      )
       activeDevice = camera
       activeDeviceId = deviceId
       completion(.success(true))
       return
     }
     if pendingOpenCompletion != nil {
-      Self.log.error(
-        "openSession.reject deviceId=\(deviceId, privacy: .public) reason=another_in_progress")
+      log(
+        "openSession.reject",
+        "deviceId=\(deviceId) reason=another_in_progress",
+        error: true
+      )
       completion(.failure(iccError(code: 409,
         message: "Another openSession is in progress")))
       return
@@ -123,27 +155,35 @@ final class IccDeviceCoordinator: NSObject {
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
-    Self.log.info(
-      "openSession.requestOpenSession issued deviceId=\(deviceId, privacy: .public)")
+    log(
+      "openSession.requestOpenSession",
+      "issued deviceId=\(deviceId)"
+    )
     camera.requestOpenSession()
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
-    Self.log.info(
-      "closeSession.request deviceId=\(self.activeDeviceId ?? "<none>", privacy: .public)")
+    log(
+      "closeSession.request",
+      "deviceId=\(activeDeviceId ?? "<none>")"
+    )
     guard let camera = activeDevice else {
       completion(.success(()))
       return
     }
     if !camera.hasOpenSession {
-      Self.log.info("closeSession.fastpath reason=already_closed")
+      log("closeSession.fastpath", "reason=already_closed")
       activeDevice = nil
       activeDeviceId = nil
       completion(.success(()))
       return
     }
     if pendingCloseCompletion != nil {
-      Self.log.error("closeSession.reject reason=another_in_progress")
+      log(
+        "closeSession.reject",
+        "reason=another_in_progress",
+        error: true
+      )
       completion(.failure(iccError(code: 409,
         message: "Another closeSession is in progress")))
       return
@@ -161,8 +201,11 @@ final class IccDeviceCoordinator: NSObject {
     completion: @escaping (Result<PtpCommandResult, Error>) -> Void
   ) {
     guard let camera = activeDevice, camera.hasOpenSession else {
-      Self.log.error(
-        "command.reject opcode=0x\(String(opcode, radix: 16), privacy: .public) reason=no_open_session")
+      log(
+        "command.reject",
+        "opcode=0x\(String(opcode, radix: 16)) reason=no_open_session",
+        error: true
+      )
       completion(.failure(iccError(code: 400,
         message: "No open ICA session — call openSession first")))
       return
@@ -177,8 +220,10 @@ final class IccDeviceCoordinator: NSObject {
     pendingCommandOpcodes[requestId] = opcode
     let ctx = Unmanaged.passRetained(requestId as NSString).toOpaque()
 
-    Self.log.debug(
-      "command.request opcode=0x\(String(opcode, radix: 16), privacy: .public) tx=\(txId)")
+    log(
+      "command.request",
+      "opcode=0x\(String(opcode, radix: 16)) tx=\(txId)"
+    )
     camera.requestSendPTPCommand(
       cmdBlock,
       outData: outData,
@@ -206,8 +251,14 @@ final class IccDeviceCoordinator: NSObject {
       guard let self = self else { return }
       guard let newValue = change.newValue else { return }
       let pct = Int64(newValue)
-      Self.log.info(
-        "catalog.progress deviceId=\(deviceId, privacy: .public) percent=\(pct)")
+      let elapsedMs = self.pendingOpenStartedAt == 0
+        ? Int64(-1)
+        : Int64((CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
+      self.log(
+        "catalog.progress",
+        "deviceId=\(deviceId) percent=\(pct)",
+        elapsedMs: elapsedMs
+      )
       self.emitProgress(deviceId: deviceId, phase: "catalog", percent: pct)
     }
   }
@@ -219,8 +270,12 @@ final class IccDeviceCoordinator: NSObject {
       guard let completion = self.pendingOpenCompletion else { return }
       let elapsedMs = Int64(
         (CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
-      Self.log.error(
-        "openSession.timeout deviceId=\(deviceId, privacy: .public) elapsedMs=\(elapsedMs)")
+      self.log(
+        "openSession.timeout",
+        "deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       self.pendingOpenCompletion = nil
       self.pendingOpenDeviceId = nil
       self.catalogObserver?.invalidate()
@@ -375,16 +430,23 @@ final class IccDeviceCoordinator: NSObject {
     } ?? -1
 
     if let error = error {
-      Self.log.error(
-        "command.error opcode=0x\(String(opcode, radix: 16), privacy: .public) elapsedMs=\(elapsedMs) err=\(error.localizedDescription, privacy: .public)")
+      log(
+        "command.error",
+        "opcode=0x\(String(opcode, radix: 16)) elapsedMs=\(elapsedMs) err=\(error.localizedDescription)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       completion(.failure(error))
       return
     }
 
     let (respCode, respParams) = parseResponseBlock(response as Data?)
     let inBytes = (inData as Data?) ?? Data()
-    Self.log.debug(
-      "command.response opcode=0x\(String(opcode, radix: 16), privacy: .public) respCode=0x\(String(respCode, radix: 16), privacy: .public) elapsedMs=\(elapsedMs) inBytes=\(inBytes.count)")
+    log(
+      "command.response",
+      "opcode=0x\(String(opcode, radix: 16)) respCode=0x\(String(respCode, radix: 16)) elapsedMs=\(elapsedMs) inBytes=\(inBytes.count)",
+      elapsedMs: elapsedMs
+    )
     let result = PtpCommandResult(
       responseCode: Int64(respCode),
       responseParams: respParams,
@@ -406,8 +468,10 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
   ) {
     guard let camera = device as? ICCameraDevice else { return }
     let deviceId = idFor(camera)
-    Self.log.info(
-      "browser.didAdd deviceId=\(deviceId, privacy: .public) name=\(camera.name ?? "<nil>", privacy: .public) moreComing=\(moreComing)")
+    log(
+      "browser.didAdd",
+      "deviceId=\(deviceId) name=\(camera.name ?? "<nil>") moreComing=\(moreComing)"
+    )
     devicesById[deviceId] = camera
     let info = makeInfo(deviceId: deviceId, device: camera)
     flutterApi.onDeviceAdded(device: info) { _ in }
@@ -419,8 +483,10 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
     moreGoing: Bool
   ) {
     let deviceId = idFor(device)
-    Self.log.info(
-      "browser.didRemove deviceId=\(deviceId, privacy: .public) moreGoing=\(moreGoing)")
+    log(
+      "browser.didRemove",
+      "deviceId=\(deviceId) moreGoing=\(moreGoing)"
+    )
     devicesById.removeValue(forKey: deviceId)
     flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
 
@@ -448,7 +514,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     // didRemove(_:)` reliably fires when a camera is unplugged mid-session,
     // and which one depends on SDK version. Handle both, idempotently.
     let deviceId = idFor(device)
-    Self.log.info("device.didRemove deviceId=\(deviceId, privacy: .public)")
+    log("device.didRemove", "deviceId=\(deviceId)")
     let wasActive = (activeDeviceId == deviceId)
     devicesById.removeValue(forKey: deviceId)
     if wasActive {
@@ -473,24 +539,35 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     pendingOpenWatchdog = nil
 
     guard let completion = pendingOpenCompletion else {
-      Self.log.error(
-        "openSession.didOpen without_pending deviceId=\(deviceId, privacy: .public) elapsedMs=\(elapsedMs)")
+      log(
+        "openSession.didOpen",
+        "without_pending deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       return
     }
     pendingOpenCompletion = nil
     pendingOpenDeviceId = nil
 
     if let error = error {
-      Self.log.error(
-        "openSession.didOpen err deviceId=\(deviceId, privacy: .public) elapsedMs=\(elapsedMs) err=\(error.localizedDescription, privacy: .public)")
+      log(
+        "openSession.didOpen",
+        "err deviceId=\(deviceId) elapsedMs=\(elapsedMs) err=\(error.localizedDescription)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       catalogObserver?.invalidate()
       catalogObserver = nil
       activeDevice = nil
       activeDeviceId = nil
       completion(.failure(error))
     } else {
-      Self.log.info(
-        "openSession.didOpen ok deviceId=\(deviceId, privacy: .public) elapsedMs=\(elapsedMs)")
+      log(
+        "openSession.didOpen",
+        "ok deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+        elapsedMs: elapsedMs
+      )
       emitProgress(deviceId: deviceId, phase: "ready", percent: 100)
       // Keep the catalog observer alive after ready — camera-side indexing
       // can continue and downstream clients (e.g. gallery) may still care.
@@ -502,7 +579,12 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     let elapsedMs = Int64(
       (CFAbsoluteTimeGetCurrent() - pendingCloseStartedAt) * 1000)
     guard let completion = pendingCloseCompletion else {
-      Self.log.error("closeSession.didClose without_pending elapsedMs=\(elapsedMs)")
+      log(
+        "closeSession.didClose",
+        "without_pending elapsedMs=\(elapsedMs)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       return
     }
     pendingCloseCompletion = nil
@@ -511,11 +593,19 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     activeDevice = nil
     activeDeviceId = nil
     if let error = error {
-      Self.log.error(
-        "closeSession.didClose err elapsedMs=\(elapsedMs) err=\(error.localizedDescription, privacy: .public)")
+      log(
+        "closeSession.didClose",
+        "err elapsedMs=\(elapsedMs) err=\(error.localizedDescription)",
+        error: true,
+        elapsedMs: elapsedMs
+      )
       completion(.failure(error))
     } else {
-      Self.log.info("closeSession.didClose ok elapsedMs=\(elapsedMs)")
+      log(
+        "closeSession.didClose",
+        "ok elapsedMs=\(elapsedMs)",
+        elapsedMs: elapsedMs
+      )
       completion(.success(()))
     }
   }
@@ -525,12 +615,11 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   func device(_ device: ICDevice, didEncounterError error: Error?) {
     // Non-fatal error notification — we surface fatal ones via
     // pendingOpen/CloseCompletion + PTP responseCode.
-    if let error = error {
-      Self.log.error(
-        "device.didEncounterError err=\(error.localizedDescription, privacy: .public)")
-    } else {
-      Self.log.error("device.didEncounterError err=<nil>")
-    }
+    log(
+      "device.didEncounterError",
+      "err=\(error?.localizedDescription ?? "<nil>")",
+      error: true
+    )
   }
 
   // --- ICCameraDeviceDelegate: PTP event push (the reason we're here) ---
@@ -540,8 +629,10 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     didReceivePTPEvent eventData: Data
   ) {
     let (code, txId, params) = parseEventBlock(eventData)
-    Self.log.debug(
-      "ptpEvent code=0x\(String(code, radix: 16), privacy: .public) tx=\(txId)")
+    log(
+      "ptpEvent",
+      "code=0x\(String(code, radix: 16)) tx=\(txId)"
+    )
     flutterApi.onPtpEvent(
       eventCode: Int64(code),
       transactionId: Int64(txId),
@@ -596,15 +687,18 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       ? Int64(-1)
       : Int64((CFAbsoluteTimeGetCurrent() - pendingOpenStartedAt) * 1000)
     let deviceId = activeDeviceId ?? idFor(device)
-    Self.log.info(
-      "catalog.ready deviceId=\(deviceId, privacy: .public) elapsedMs=\(elapsedMs)")
+    log(
+      "catalog.ready",
+      "deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+      elapsedMs: elapsedMs
+    )
   }
 
   func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {
-    Self.log.info("device.accessRestriction removed")
+    log("device.accessRestriction", "removed")
   }
 
   func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {
-    Self.log.info("device.accessRestriction enabled")
+    log("device.accessRestriction", "enabled")
   }
 }
