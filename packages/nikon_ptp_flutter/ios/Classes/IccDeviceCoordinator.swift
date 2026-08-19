@@ -101,6 +101,59 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenWatchdog?.cancel()
   }
 
+  // MARK: - Delegate selector gating (experimental — Phase B)
+  //
+  // Empty-SD-card test on iPhone 17 (iOS 26) + Z 30 confirmed that the
+  // ~103 s tax on the first `requestSendPTPCommand` after
+  // `didOpenSessionWithError` is Apple's ICA doing an internal
+  // enumeration of the camera's storage before allowing user PTP
+  // through. With no card, connect is instant.
+  //
+  // We do not care about ICA's file model — we drive the camera through
+  // raw PTP via `requestSendPTPCommand`. So we try the classic Cocoa
+  // trick: make ICA believe our delegate does NOT implement any of the
+  // media-catalog-related callbacks. Well-behaved AppKit / Foundation
+  // frameworks check `respondsToSelector:` before invoking an optional
+  // delegate method — if we return `false`, ICA may skip firing them,
+  // and (crucially) may skip the storage enumeration that feeds them.
+  //
+  // The Swift bridge for `ICCameraDeviceDelegate` treats these methods
+  // as required, so we still keep no-op implementations in the extension
+  // below (otherwise the file won't compile). This runtime override
+  // wins at dispatch time: the ObjC runtime consults `responds(to:)`
+  // before -performSelector: / +performSelector:withObject: /
+  // objc_msgSend on delegate lookup paths, so if ICA queries first, it
+  // will see `NO` and skip.
+  //
+  // If ICA ignores `respondsToSelector:` and dispatches unconditionally,
+  // this override is a no-op behaviourally (the methods still exist as
+  // no-op stubs). Cost of trying: zero. Payoff if it works: instant
+  // connect regardless of SD-card contents.
+  override func responds(to aSelector: Selector!) -> Bool {
+    guard let sel = aSelector else { return super.responds(to: aSelector) }
+    if Self.mediaCatalogSelectorNames.contains(NSStringFromSelector(sel)) {
+      return false
+    }
+    return super.responds(to: aSelector)
+  }
+
+  /// ObjC selector names (colon-separated) of the ICCameraDeviceDelegate
+  /// methods that trigger — or feed the results of — Apple's internal
+  /// SD-card enumeration. Hiding them from `responds(to:)` may prevent
+  /// ICA from kicking off enumeration on session open.
+  ///
+  /// Keep the "session lifecycle" and "PTP event" callbacks OUT of this
+  /// set — those are what we actually consume.
+  private static let mediaCatalogSelectorNames: Set<String> = [
+    "cameraDevice:didAddItems:",
+    "cameraDevice:didRemoveItems:",
+    "cameraDevice:didReceiveThumbnail:forItem:error:",
+    "cameraDevice:didReceiveMetadata:forItem:error:",
+    "cameraDevice:didRenameItems:",
+    "cameraDeviceDidChangeCapability:",
+    "deviceDidBecomeReadyWithCompleteContentCatalog:",
+  ]
+
   // MARK: - HostApi surface (invoked from IccPtpPlugin)
 
   func snapshot() -> [IccCameraInfo] {
