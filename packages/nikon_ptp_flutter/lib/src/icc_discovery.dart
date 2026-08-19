@@ -66,6 +66,16 @@ final class IccCameraDiscovery {
 
   /// Emits the current known-camera set. Fires once immediately with the
   /// initial snapshot, then whenever a device is added or removed.
+  ///
+  /// Additionally toggles Swift-side "eager pre-open" for the lifetime
+  /// of the subscription — the coordinator immediately opens each newly
+  /// discovered ICA session and fires a warmup PTP `GetDeviceInfo` in
+  /// the background, so by the time the user taps a camera on the
+  /// Discovery screen Apple's ~80 s first-command tax has already been
+  /// paid. When the last subscriber cancels (Discovery unmounts), eager
+  /// pre-open turns off — we don't want to hold the camera in
+  /// "connected to PC" mode when the user isn't actively about to
+  /// connect. See `IccPtpHostApi.setEagerPreOpen` docs.
   Stream<List<IccCameraDescriptor>> watch() {
     late final StreamController<List<IccCameraDescriptor>> controller;
     Future<void> refresh() async {
@@ -77,11 +87,24 @@ final class IccCameraDiscovery {
     controller = StreamController<List<IccCameraDescriptor>>.broadcast(
       onListen: () async {
         IccPtpChannel.instance.addBrowserListener(refresh);
+        // Best-effort — no HostApi on non-iOS platforms yields
+        // MissingPluginException, which we silently swallow (matches
+        // the scanOnce pattern above).
+        try {
+          await _api.setEagerPreOpen(true);
+        } on Object {
+          // Silent: non-iOS host, or plugin not registered.
+        }
         final initial = await scanOnce();
         if (!controller.isClosed) controller.add(initial);
       },
       onCancel: () {
         IccPtpChannel.instance.removeBrowserListener(refresh);
+        try {
+          unawaited(_api.setEagerPreOpen(false));
+        } on Object {
+          // Silent.
+        }
       },
     );
     return controller.stream;

@@ -106,6 +106,27 @@ abstract class IccPtpHostApi {
   /// Close the ICA session on the currently-open device. No-op if none open.
   @async
   void closeSession();
+
+  /// Enable / disable eager pre-open of the ICA session on
+  /// `ICDeviceBrowser.didAdd`. Fire-and-forget from Dart's side.
+  ///
+  /// When enabled and a browser callback surfaces a new camera, the
+  /// coordinator immediately opens the ICA session AND issues a warmup
+  /// `GetDeviceInfo` PTP command in the background. Apple's ICA holds
+  /// the first user PTP command for tens of seconds while it does its
+  /// own internal storage enumeration (`GetStorageIDs` / `GetObjectHandles`);
+  /// paying that tax on the eager pre-open means the first Dart-initiated
+  /// `sendCommand` after `openSession` returns almost instantly.
+  ///
+  /// The Dart side wires this to the lifecycle of
+  /// `IccCameraDiscovery.watch()` — enabled while a subscriber (e.g. the
+  /// Discovery screen) is listening, disabled when the last one cancels.
+  /// That way we do not hold the camera in "connected to PC" mode when
+  /// the user is not actually about to connect.
+  ///
+  /// Toggling this off does NOT close already-open sessions; they stay
+  /// open so a returning subscriber can hit the fast path.
+  void setEagerPreOpen(bool enabled);
 }
 
 @FlutterApi()

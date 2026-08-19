@@ -17,11 +17,18 @@ class _FakeHostApi extends IccPtpHostApi {
   Object? nextOpenError;
   Object? nextSendError;
   PtpCommandResult Function(PtpCommand cmd)? sendHandler;
+  List<IccCameraInfo> nextDevices = const [];
 
   // Recorded interactions
   final List<String> openedDeviceIds = [];
   final List<PtpCommand> sentCommands = [];
+  final List<bool> eagerCalls = [];
   int closedCount = 0;
+
+  @override
+  Future<List<IccCameraInfo>> devices() async {
+    return nextDevices;
+  }
 
   @override
   Future<bool> openSession(String deviceId) async {
@@ -44,6 +51,11 @@ class _FakeHostApi extends IccPtpHostApi {
   @override
   Future<void> closeSession() async {
     closedCount++;
+  }
+
+  @override
+  Future<void> setEagerPreOpen(bool enabled) async {
+    eagerCalls.add(enabled);
   }
 }
 
@@ -277,6 +289,59 @@ void main() {
       expect(diagnostics[2].tag, 'command.response');
       expect(diagnostics[2].elapsedMs, 42);
       await sub.cancel();
+    });
+  });
+
+  _discoveryTests();
+}
+
+void _discoveryTests() {
+  group('IccCameraDiscovery.watch eager pre-open lifecycle', () {
+    late _FakeHostApi fake;
+
+    setUp(() {
+      IccPtpChannel.resetForTesting();
+      fake = _FakeHostApi();
+    });
+
+    test('subscribing enables eager pre-open, cancelling disables it',
+        () async {
+      final discovery = IccCameraDiscovery(api: fake);
+      final stream = discovery.watch();
+      final sub = stream.listen((_) {});
+
+      // onListen runs in a microtask; drain.
+      await Future<void>.delayed(Duration.zero);
+      expect(fake.eagerCalls, [true]);
+
+      await sub.cancel();
+      // onCancel is synchronous but the unawaited setEagerPreOpen(false)
+      // completes in the next microtask.
+      await Future<void>.delayed(Duration.zero);
+      expect(fake.eagerCalls, [true, false]);
+    });
+
+    test('multiple subscribers toggle eager per subscription lifecycle',
+        () async {
+      final discovery = IccCameraDiscovery(api: fake);
+      final stream = discovery.watch();
+      final sub1 = stream.listen((_) {});
+      await Future<void>.delayed(Duration.zero);
+      final sub2 = stream.listen((_) {});
+      await Future<void>.delayed(Duration.zero);
+
+      // Broadcast controller only fires onListen once (first subscriber).
+      expect(fake.eagerCalls, [true]);
+
+      await sub1.cancel();
+      await Future<void>.delayed(Duration.zero);
+      // Still subscribed via sub2 — onCancel not fired.
+      expect(fake.eagerCalls, [true]);
+
+      await sub2.cancel();
+      await Future<void>.delayed(Duration.zero);
+      // Now all subscribers gone → onCancel fires → eager off.
+      expect(fake.eagerCalls, [true, false]);
     });
   });
 }

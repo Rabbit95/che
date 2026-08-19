@@ -85,4 +85,8 @@ extension IccPtpPlugin: IccPtpHostApi {
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
     coordinator.closeSession(completion: completion)
   }
+
+  func setEagerPreOpen(enabled: Bool) throws {
+    coordinator.setEagerPreOpen(enabled)
+  }
 }

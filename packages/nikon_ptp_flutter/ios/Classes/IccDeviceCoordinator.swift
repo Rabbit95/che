@@ -55,9 +55,14 @@ final class IccDeviceCoordinator: NSObject {
   private var activeDeviceId: String?
 
   // Session open/close are ICA delegate callbacks, so we stash the pigeon
-  // completion here until didOpenSessionWithError / didCloseSessionWithError
+  // completions here until didOpenSessionWithError / didCloseSessionWithError
   // fires. Guarded implicitly by ICA serialising these delegate calls.
-  private var pendingOpenCompletion: ((Result<Bool, Error>) -> Void)?
+  //
+  // `pendingOpenCompletions` is a LIST rather than a single value because
+  // an eager pre-open (fire-and-forget) can be in flight when the user
+  // taps the same camera — the user's real completion is appended and
+  // both fire when the warmup completes.
+  private var pendingOpenCompletions: [(Result<Bool, Error>) -> Void] = []
   private var pendingOpenDeviceId: String?
   private var pendingOpenStartedAt: CFAbsoluteTime = 0
   private var pendingOpenWatchdog: DispatchWorkItem?
@@ -72,6 +77,15 @@ final class IccDeviceCoordinator: NSObject {
     [String: (Result<PtpCommandResult, Error>) -> Void] = [:]
   private var pendingCommandStartedAt: [String: CFAbsoluteTime] = [:]
   private var pendingCommandOpcodes: [String: Int64] = [:]
+
+  // Eager pre-open state (see setEagerPreOpen). When enabled, a browser
+  // `didAdd` triggers an in-background `requestOpenSession` + warmup PTP
+  // `GetDeviceInfo` so that when the user later taps the camera the ICA
+  // first-command tax has already been paid. `warmupCompletedDeviceIds`
+  // gates the "already warm, skip warmup" fast path.
+  private var eagerPreOpenEnabled: Bool = false
+  private var warmupCompletedDeviceIds: Set<String> = []
+  private var warmupInProgress: Bool = false
 
   // The openSession watchdog. Kept as an instance constant so tests could
   // override it — currently only used by the default 120 s deadline.
@@ -177,29 +191,92 @@ final class IccDeviceCoordinator: NSObject {
         message: "Device \(deviceId) not in browser cache")))
       return
     }
-    if camera.hasOpenSession {
+    // Fast path: session open AND warmup already paid. Both matter — an
+    // eager pre-open may have succeeded at didOpenSessionWithError but the
+    // warmup PTP might still be in flight, in which case we must ATTACH
+    // (below) rather than return success too early and let Dart's first
+    // PTP eat the tax anyway.
+    if camera.hasOpenSession
+      && warmupCompletedDeviceIds.contains(deviceId)
+    {
       log(
         "openSession.fastpath",
-        "deviceId=\(deviceId) reason=already_open"
+        "deviceId=\(deviceId) reason=warm"
       )
       activeDevice = camera
       activeDeviceId = deviceId
       completion(.success(true))
       return
     }
-    if pendingOpenCompletion != nil {
+    // Attach: an open (eager or user) is already in flight for THIS device.
+    if !pendingOpenCompletions.isEmpty
+      && pendingOpenDeviceId == deviceId
+    {
+      log(
+        "openSession.attach",
+        "deviceId=\(deviceId) reason=in_progress"
+      )
+      pendingOpenCompletions.append(completion)
+      return
+    }
+    // Reject: an open is in progress for a DIFFERENT device.
+    if !pendingOpenCompletions.isEmpty {
+      let busyWith = pendingOpenDeviceId ?? "?"
       log(
         "openSession.reject",
-        "deviceId=\(deviceId) reason=another_in_progress",
+        "deviceId=\(deviceId) reason=busy_with_\(busyWith)",
         error: true
       )
       completion(.failure(iccError(code: 409,
-        message: "Another openSession is in progress")))
+        message: "Another openSession is in progress for \(busyWith)")))
       return
     }
+    startFreshOpen(deviceId: deviceId, camera: camera,
+      completion: completion)
+  }
+
+  /// Set the eager pre-open flag. When enabled, `deviceBrowser(_:didAdd:)`
+  /// immediately opens the ICA session and fires a warmup PTP
+  /// `GetDeviceInfo`, so that when the user later taps the camera the
+  /// first-PTP tax has already been paid. Called by the Dart side from
+  /// `IccCameraDiscovery.watch()` onListen / onCancel.
+  func setEagerPreOpen(_ enabled: Bool) {
+    log("eager.setEnabled", "enabled=\(enabled)")
+    eagerPreOpenEnabled = enabled
+    if enabled {
+      // Kick off eager pre-open for devices the browser already surfaced
+      // before eager was turned on (e.g. camera was plugged in before
+      // Discovery mounted).
+      for (deviceId, camera) in devicesById {
+        tryStartEagerOpen(deviceId: deviceId, camera: camera)
+      }
+    }
+    // On disable, deliberately DO NOT close existing sessions —
+    // (a) user may come back to Discovery and hit the fast path;
+    // (b) racing a close against an in-flight warmup is fiddly.
+  }
+
+  private func tryStartEagerOpen(
+    deviceId: String, camera: ICCameraDevice
+  ) {
+    guard pendingOpenCompletions.isEmpty else { return }
+    guard pendingOpenDeviceId == nil else { return }
+    guard !camera.hasOpenSession else { return }
+    log("eager.start", "auto-opening deviceId=\(deviceId) in background")
+    startFreshOpen(deviceId: deviceId, camera: camera) { _ in
+      // Fire-and-forget — user's later openSession will hit the fast path
+      // once warmupCompletedDeviceIds contains this deviceId.
+    }
+  }
+
+  private func startFreshOpen(
+    deviceId: String,
+    camera: ICCameraDevice,
+    completion: @escaping (Result<Bool, Error>) -> Void
+  ) {
     activeDevice = camera
     activeDeviceId = deviceId
-    pendingOpenCompletion = completion
+    pendingOpenCompletions = [completion]
     pendingOpenDeviceId = deviceId
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
     camera.delegate = self
@@ -263,27 +340,13 @@ final class IccDeviceCoordinator: NSObject {
         message: "No open ICA session — call openSession first")))
       return
     }
-    let cmdBlock = buildCommandBlock(
-      opcode: opcode, txId: txId, params: params)
-
-    // Retained NSString round-trips through ICA's opaque contextInfo pointer.
-    let requestId = UUID().uuidString
-    pendingCommands[requestId] = completion
-    pendingCommandStartedAt[requestId] = CFAbsoluteTimeGetCurrent()
-    pendingCommandOpcodes[requestId] = opcode
-    let ctx = Unmanaged.passRetained(requestId as NSString).toOpaque()
-
-    log(
-      "command.request",
-      "opcode=0x\(String(opcode, radix: 16)) tx=\(txId)"
-    )
-    camera.requestSendPTPCommand(
-      cmdBlock,
+    sendRawPTP(
+      camera: camera,
+      opcode: opcode,
+      txId: txId,
+      params: params,
       outData: outData,
-      sendCommandDelegate: self,
-      didSendCommand: #selector(
-        didSendPTPCommand(_:inData:response:error:contextInfo:)),
-      contextInfo: ctx
+      completion: completion
     )
   }
 
@@ -320,7 +383,7 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenWatchdog?.cancel()
     let workItem = DispatchWorkItem { [weak self] in
       guard let self = self else { return }
-      guard let completion = self.pendingOpenCompletion else { return }
+      guard !self.pendingOpenCompletions.isEmpty else { return }
       let elapsedMs = Int64(
         (CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
       self.log(
@@ -329,7 +392,8 @@ final class IccDeviceCoordinator: NSObject {
         error: true,
         elapsedMs: elapsedMs
       )
-      self.pendingOpenCompletion = nil
+      let comps = self.pendingOpenCompletions
+      self.pendingOpenCompletions = []
       self.pendingOpenDeviceId = nil
       self.catalogObserver?.invalidate()
       self.catalogObserver = nil
@@ -338,10 +402,11 @@ final class IccDeviceCoordinator: NSObject {
       self.emitProgress(deviceId: deviceId, phase: "timeout", percent: -1)
       self.flutterApi.onSessionEnded(
         deviceId: deviceId, reason: "timeout") { _ in }
-      completion(.failure(self.iccError(
+      let err = self.iccError(
         code: 504,
         message:
-          "ICA openSession timeout after \(Int(self.openSessionTimeoutSeconds))s")))
+          "ICA openSession timeout after \(Int(self.openSessionTimeoutSeconds))s")
+      for c in comps { c(.failure(err)) }
     }
     pendingOpenWatchdog = workItem
     DispatchQueue.main.asyncAfter(
@@ -528,6 +593,14 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
     devicesById[deviceId] = camera
     let info = makeInfo(deviceId: deviceId, device: camera)
     flutterApi.onDeviceAdded(device: info) { _ in }
+
+    // Eager pre-open: only when Dart-side Discovery is subscribed
+    // (`setEagerPreOpen(true)`). Kicks off `requestOpenSession` +
+    // warmup PTP in the background so a user tap later hits the fast
+    // path.
+    if eagerPreOpenEnabled {
+      tryStartEagerOpen(deviceId: deviceId, camera: camera)
+    }
   }
 
   func deviceBrowser(
@@ -541,6 +614,7 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
       "deviceId=\(deviceId) moreGoing=\(moreGoing)"
     )
     devicesById.removeValue(forKey: deviceId)
+    warmupCompletedDeviceIds.remove(deviceId)
     flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
 
     if activeDeviceId == deviceId {
@@ -550,6 +624,16 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
       pendingOpenWatchdog = nil
       catalogObserver?.invalidate()
       catalogObserver = nil
+      // Fire any waiting completions with an unplug error so callers
+      // don't hang forever on a device that's gone.
+      if !pendingOpenCompletions.isEmpty {
+        let comps = pendingOpenCompletions
+        pendingOpenCompletions = []
+        pendingOpenDeviceId = nil
+        let err = iccError(code: 410,
+          message: "Device \(deviceId) unplugged during openSession")
+        for c in comps { c(.failure(err)) }
+      }
       flutterApi.onSessionEnded(
         deviceId: deviceId, reason: "unplug") { _ in }
     }
@@ -570,6 +654,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     log("device.didRemove", "deviceId=\(deviceId)")
     let wasActive = (activeDeviceId == deviceId)
     devicesById.removeValue(forKey: deviceId)
+    warmupCompletedDeviceIds.remove(deviceId)
     if wasActive {
       activeDevice = nil
       activeDeviceId = nil
@@ -577,6 +662,14 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       pendingOpenWatchdog = nil
       catalogObserver?.invalidate()
       catalogObserver = nil
+      if !pendingOpenCompletions.isEmpty {
+        let comps = pendingOpenCompletions
+        pendingOpenCompletions = []
+        pendingOpenDeviceId = nil
+        let err = iccError(code: 410,
+          message: "Device \(deviceId) unplugged during openSession")
+        for c in comps { c(.failure(err)) }
+      }
       flutterApi.onSessionEnded(
         deviceId: deviceId, reason: "unplug") { _ in }
     }
@@ -591,7 +684,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     pendingOpenWatchdog?.cancel()
     pendingOpenWatchdog = nil
 
-    guard let completion = pendingOpenCompletion else {
+    if pendingOpenCompletions.isEmpty {
       log(
         "openSession.didOpen",
         "without_pending deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
@@ -600,8 +693,6 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       )
       return
     }
-    pendingOpenCompletion = nil
-    pendingOpenDeviceId = nil
 
     if let error = error {
       log(
@@ -610,22 +701,114 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
         error: true,
         elapsedMs: elapsedMs
       )
+      let comps = pendingOpenCompletions
+      pendingOpenCompletions = []
+      pendingOpenDeviceId = nil
       catalogObserver?.invalidate()
       catalogObserver = nil
       activeDevice = nil
       activeDeviceId = nil
-      completion(.failure(error))
-    } else {
-      log(
-        "openSession.didOpen",
-        "ok deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
-        elapsedMs: elapsedMs
-      )
-      emitProgress(deviceId: deviceId, phase: "ready", percent: 100)
-      // Keep the catalog observer alive after ready — camera-side indexing
-      // can continue and downstream clients (e.g. gallery) may still care.
-      completion(.success(true))
+      for c in comps { c(.failure(error)) }
+      return
     }
+
+    // Success: fire warmup PTP GetDeviceInfo BEFORE releasing the
+    // pending completions. That way, when the pigeon completion resolves
+    // on the Dart side, Apple's ICA has already paid its ~80 s internal
+    // first-command tax and Dart's own PTP commands land on a warm session.
+    // If a user tap arrives during warmup, they attach to
+    // `pendingOpenCompletions` (see openSession above) and fire together.
+    log(
+      "openSession.didOpen",
+      "ok deviceId=\(deviceId) elapsedMs=\(elapsedMs), starting warmup",
+      elapsedMs: elapsedMs
+    )
+    emitProgress(deviceId: deviceId, phase: "ready", percent: 100)
+    guard let camera = device as? ICCameraDevice else {
+      // Defensive — device delegate wired only on ICCameraDevice, but if
+      // we ever get here without a camera, skip warmup and fire success.
+      let comps = pendingOpenCompletions
+      pendingOpenCompletions = []
+      pendingOpenDeviceId = nil
+      for c in comps { c(.success(true)) }
+      return
+    }
+    fireWarmup(deviceId: deviceId, camera: camera)
+  }
+
+  /// Fire the warmup `GetDeviceInfo` PTP command so Apple's ICA
+  /// internal enumeration runs in the background before Dart sees a
+  /// session-ready callback. Marks `warmupCompletedDeviceIds` and
+  /// releases all `pendingOpenCompletions` on completion (success or
+  /// failure — the session IS open regardless, and Dart's own commands
+  /// will surface their own errors).
+  private func fireWarmup(deviceId: String, camera: ICCameraDevice) {
+    guard !warmupInProgress else { return }
+    warmupInProgress = true
+    let warmupStart = CFAbsoluteTimeGetCurrent()
+    log("warmup.start",
+      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId)")
+    sendRawPTP(
+      camera: camera,
+      opcode: 0x1001, // GetDeviceInfo
+      txId: 1,
+      params: [],
+      outData: nil
+    ) { [weak self] result in
+      guard let self = self else { return }
+      self.warmupInProgress = false
+      let elapsedMs = Int64(
+        (CFAbsoluteTimeGetCurrent() - warmupStart) * 1000)
+      switch result {
+      case .success(let r):
+        self.log(
+          "warmup.done",
+          "ok elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
+          elapsedMs: elapsedMs
+        )
+      case .failure(let e):
+        self.log(
+          "warmup.done",
+          "err elapsedMs=\(elapsedMs) err=\(e.localizedDescription)",
+          error: true,
+          elapsedMs: elapsedMs
+        )
+      }
+      self.warmupCompletedDeviceIds.insert(deviceId)
+      let comps = self.pendingOpenCompletions
+      self.pendingOpenCompletions = []
+      self.pendingOpenDeviceId = nil
+      for c in comps { c(.success(true)) }
+    }
+  }
+
+  /// Extracted PTP command send path — shared between user-visible
+  /// `sendPtpCommand(...)` and the internal warmup.
+  private func sendRawPTP(
+    camera: ICCameraDevice,
+    opcode: Int64,
+    txId: Int64,
+    params: [Int64],
+    outData: Data?,
+    completion: @escaping (Result<PtpCommandResult, Error>) -> Void
+  ) {
+    let cmdBlock = buildCommandBlock(
+      opcode: opcode, txId: txId, params: params)
+    let requestId = UUID().uuidString
+    pendingCommands[requestId] = completion
+    pendingCommandStartedAt[requestId] = CFAbsoluteTimeGetCurrent()
+    pendingCommandOpcodes[requestId] = opcode
+    let ctx = Unmanaged.passRetained(requestId as NSString).toOpaque()
+    log("command.request",
+      "opcode=0x\(String(opcode, radix: 16)) tx=\(txId)")
+    camera.requestSendPTPCommand(
+      cmdBlock,
+      outData: outData,
+      sendCommandDelegate: self,
+      didSendCommand: #selector(
+        didSendPTPCommand(_:inData:response:error:contextInfo:)),
+      contextInfo: ctx
+    )
   }
 
   func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
@@ -643,6 +826,10 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     pendingCloseCompletion = nil
     catalogObserver?.invalidate()
     catalogObserver = nil
+    if let closedId = activeDeviceId {
+      // Session is gone → warmup would have to re-run next open.
+      warmupCompletedDeviceIds.remove(closedId)
+    }
     activeDevice = nil
     activeDeviceId = nil
     if let error = error {

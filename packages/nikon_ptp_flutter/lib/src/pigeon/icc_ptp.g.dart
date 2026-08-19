@@ -313,6 +313,47 @@ class IccPtpHostApi {
       return;
     }
   }
+
+  /// Enable / disable eager pre-open of the ICA session on
+  /// `ICDeviceBrowser.didAdd`. Fire-and-forget from Dart's side.
+  ///
+  /// When enabled and a browser callback surfaces a new camera, the
+  /// coordinator immediately opens the ICA session AND issues a warmup
+  /// `GetDeviceInfo` PTP command in the background. Apple's ICA holds
+  /// the first user PTP command for tens of seconds while it does its
+  /// own internal storage enumeration (`GetStorageIDs` / `GetObjectHandles`);
+  /// paying that tax on the eager pre-open means the first Dart-initiated
+  /// `sendCommand` after `openSession` returns almost instantly.
+  ///
+  /// The Dart side wires this to the lifecycle of
+  /// `IccCameraDiscovery.watch()` — enabled while a subscriber (e.g. the
+  /// Discovery screen) is listening, disabled when the last one cancels.
+  /// That way we do not hold the camera in "connected to PC" mode when
+  /// the user is not actually about to connect.
+  ///
+  /// Toggling this off does NOT close already-open sessions; they stay
+  /// open so a returning subscriber can hit the fast path.
+  Future<void> setEagerPreOpen(bool enabled) async {
+    final String pigeonVar_channelName = 'dev.flutter.pigeon.nikon_ptp_flutter.IccPtpHostApi.setEagerPreOpen$pigeonVar_messageChannelSuffix';
+    final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final List<Object?>? pigeonVar_replyList =
+        await pigeonVar_channel.send(<Object?>[enabled]) as List<Object?>?;
+    if (pigeonVar_replyList == null) {
+      throw _createConnectionError(pigeonVar_channelName);
+    } else if (pigeonVar_replyList.length > 1) {
+      throw PlatformException(
+        code: pigeonVar_replyList[0]! as String,
+        message: pigeonVar_replyList[1] as String?,
+        details: pigeonVar_replyList[2],
+      );
+    } else {
+      return;
+    }
+  }
 }
 
 abstract class IccPtpFlutterApi {
