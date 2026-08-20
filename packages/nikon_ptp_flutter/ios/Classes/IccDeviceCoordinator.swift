@@ -125,7 +125,9 @@ final class IccDeviceCoordinator: NSObject {
     if #available(iOS 18.0, *) {
       log("auth.control.request",
         "requesting control-only authorization (never contents)")
-      ICDeviceBrowser.requestControlAuthorization { [weak self] status in
+      // NB: instance method on the browser instance, NOT a class method
+      // (empirically verified via Xcode compile error).
+      self.browser.requestControlAuthorization { [weak self] status in
         self?.log(
           "auth.control.result",
           "status=\(status.rawValue) (0=notDetermined 1=restricted 2=denied 3=authorized)"
