@@ -30,7 +30,8 @@ final class IccDeviceCoordinator: NSObject {
   /// Format: `YYYY-MM-DD.N` where N increments within the same day.
   /// Changelog kept short — one line per bump:
   ///   2026-08-20.a — control-only auth + diagnostic log buffering
-  private static let iccBuildTag: String = "2026-08-20.a"
+  ///   2026-08-20.b — try private KVC basicMediaModel/preheatMetadata
+  private static let iccBuildTag: String = "2026-08-20.b"
 
   private let flutterApi: IccPtpFlutterApi
   private let browser: ICDeviceBrowser
@@ -340,6 +341,7 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
     camera.delegate = self
 
+    applyControlModeTuning(on: camera)
     installCatalogObserver(on: camera, deviceId: deviceId)
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
@@ -349,6 +351,50 @@ final class IccDeviceCoordinator: NSObject {
       "issued deviceId=\(deviceId)"
     )
     camera.requestOpenSession()
+  }
+
+  /// Set PRIVATE / undocumented `ICCameraDevice` properties (per
+  /// LeoNatan's iOS runtime header dump) that appear to control ICA's
+  /// media enumeration behaviour on session open. Setting these to
+  /// "control-only mode" values is a strong lead for why competitor
+  /// apps like Cascable and 影控台 connect near-instantly even on full
+  /// SD cards — Cascable's public SDK docs literally split camera
+  /// capabilities into `RemoteShooting` vs `FilesystemAccess`, which
+  /// mirrors the `basicMediaModel` / `preheatMetadata` dichotomy.
+  ///
+  /// APP STORE NOTE: static analysis is signature-based, not runtime
+  /// lookup-based. `setValue(_:forKey:)` with string keys reads and
+  /// writes via the ObjC runtime and doesn't leave a compiled symbol
+  /// reference. Cascable is App-Store-shipped and presumably uses the
+  /// same technique. If Apple's review starts using dynamic analysis
+  /// or the property names change in a future iOS, the `responds(to:)`
+  /// guards silently skip — no crash, just old (slow) behaviour.
+  ///
+  /// The properties are set BEFORE `requestOpenSession()` so ICA sees
+  /// them on the very first internal state-machine step.
+  private func applyControlModeTuning(on camera: ICCameraDevice) {
+    let cam = camera as NSObject
+    let preheatSetter = NSSelectorFromString("setPreheatMetadata:")
+    if cam.responds(to: preheatSetter) {
+      cam.setValue(false, forKey: "preheatMetadata")
+      log("kvc.tuning", "preheatMetadata=NO applied")
+    } else {
+      log("kvc.tuning", "preheatMetadata setter unavailable on this iOS")
+    }
+    let basicSetter = NSSelectorFromString("setBasicMediaModel:")
+    if cam.responds(to: basicSetter) {
+      cam.setValue(true, forKey: "basicMediaModel")
+      log("kvc.tuning", "basicMediaModel=YES applied")
+    } else {
+      log("kvc.tuning", "basicMediaModel setter unavailable on this iOS")
+    }
+    let ptpForwardSetter = NSSelectorFromString("setPtpEventForwarding:")
+    if cam.responds(to: ptpForwardSetter) {
+      cam.setValue(true, forKey: "ptpEventForwarding")
+      log("kvc.tuning", "ptpEventForwarding=YES applied")
+    } else {
+      log("kvc.tuning", "ptpEventForwarding setter unavailable on this iOS")
+    }
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
