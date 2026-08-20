@@ -264,6 +264,47 @@ void main() {
       await sub.cancel();
     });
 
+    test(
+      'diagnosticLogs replays buffered entries to a late-attaching listener',
+      () async {
+        // Simulate the real-world race: Swift emits log lines from
+        // IccDeviceCoordinator.init() and setEagerPreOpen(true) BEFORE
+        // any Dart listener attaches (that happens later, in
+        // IccTransport.open()). Buffering in IccPtpChannel ensures those
+        // early lines still reach the in-app copy log.
+        IccPtpChannel.instance.onDiagnosticLog(
+          'browser.init', 'coordinator constructed iccBuildTag=xxx', -1);
+        IccPtpChannel.instance.onDiagnosticLog(
+          'auth.control.status', 'status=3 (authorized)', -1);
+        IccPtpChannel.instance.onDiagnosticLog(
+          'eager.setEnabled', 'enabled=true iccBuildTag=xxx', -1);
+
+        // Subscribe BEFORE open() — this mirrors how ConnectionController
+        // wires things up: it listens on `transport.diagnosticLogs` and
+        // THEN awaits `transport.open(config)`. That way, when the buffer
+        // is replayed into the internal broadcast controller inside open(),
+        // the subscriber is present and receives the events.
+        final diagnostics = <IccDiagnosticLog>[];
+        final sub = transport.diagnosticLogs.listen(diagnostics.add);
+
+        await transport.open(TransportConfig.icc(iccDeviceId: 'icc-x'));
+        await Future<void>.delayed(Duration.zero);
+
+        // All three buffered lines should have been replayed to the
+        // late listener.
+        expect(diagnostics.length, greaterThanOrEqualTo(3));
+        expect(
+          diagnostics.map((d) => d.tag).toList(),
+          containsAll([
+            'browser.init',
+            'auth.control.status',
+            'eager.setEnabled',
+          ]),
+        );
+        await sub.cancel();
+      },
+    );
+
     test('diagnosticLogs stream forwards Swift os.Logger mirror events',
         () async {
       await transport.open(TransportConfig.icc(iccDeviceId: 'icc-x'));

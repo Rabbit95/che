@@ -34,6 +34,7 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     _cached?._sessionEndedListener = null;
     _cached?._sessionOpenProgressListener = null;
     _cached?._diagnosticLogListener = null;
+    _cached?._diagnosticLogBuffer.clear();
     _cached = null;
   }
 
@@ -52,6 +53,19 @@ final class IccPtpChannel implements IccPtpFlutterApi {
   )? _sessionOpenProgressListener;
   void Function(String tag, String message, int elapsedMs)?
       _diagnosticLogListener;
+
+  /// Ring buffer of recent Swift-side diagnostic logs. Swift emits log
+  /// lines from `IccDeviceCoordinator.init()` and `setEagerPreOpen(true)`
+  /// (Discovery mount time) which fire BEFORE a listener attaches from
+  /// `IccTransport.open()` (user tap time). Without buffering, those
+  /// early lines — including the crucial `auth.control.status` — would
+  /// be dropped and never reach the in-app copy log.
+  ///
+  /// When a listener attaches, the buffer is replayed to it, so the
+  /// user's copied log always contains the full trace back through the
+  /// last N events (capped at [_maxDiagnosticLogBuffer]).
+  static const int _maxDiagnosticLogBuffer = 200;
+  final List<_DiagnosticLogEntry> _diagnosticLogBuffer = [];
 
   void addBrowserListener(Future<void> Function() cb) {
     _browserListeners.add(cb);
@@ -88,6 +102,14 @@ final class IccPtpChannel implements IccPtpFlutterApi {
     void Function(String tag, String message, int elapsedMs)? cb,
   ) {
     _diagnosticLogListener = cb;
+    if (cb != null) {
+      // Replay buffered entries so listeners attaching late (e.g. after
+      // Discovery mount) still see the init-time + Discovery-time logs
+      // (auth.control.status, eager.setEnabled, browser.init).
+      for (final entry in _diagnosticLogBuffer) {
+        cb(entry.tag, entry.message, entry.elapsedMs);
+      }
+    }
   }
 
   @override
@@ -122,6 +144,10 @@ final class IccPtpChannel implements IccPtpFlutterApi {
 
   @override
   void onDiagnosticLog(String tag, String message, int elapsedMs) {
+    _diagnosticLogBuffer.add(_DiagnosticLogEntry(tag, message, elapsedMs));
+    if (_diagnosticLogBuffer.length > _maxDiagnosticLogBuffer) {
+      _diagnosticLogBuffer.removeAt(0);
+    }
     _diagnosticLogListener?.call(tag, message, elapsedMs);
   }
 
@@ -130,4 +156,11 @@ final class IccPtpChannel implements IccPtpFlutterApi {
       await cb();
     }
   }
+}
+
+class _DiagnosticLogEntry {
+  const _DiagnosticLogEntry(this.tag, this.message, this.elapsedMs);
+  final String tag;
+  final String message;
+  final int elapsedMs;
 }

@@ -22,6 +22,16 @@ final class IccDeviceCoordinator: NSObject {
   private static let log = Logger(
     subsystem: "com.che.nikon_ptp_flutter", category: "icc")
 
+  /// Bump this whenever the ICC connection logic changes. Printed at
+  /// every session-relevant transition so the user can copy the log
+  /// and we can tell which build is actually running (independent of
+  /// pubspec CFBundleShortVersionString).
+  ///
+  /// Format: `YYYY-MM-DD.N` where N increments within the same day.
+  /// Changelog kept short — one line per bump:
+  ///   2026-08-20.a — control-only auth + diagnostic log buffering
+  private static let iccBuildTag: String = "2026-08-20.a"
+
   private let flutterApi: IccPtpFlutterApi
   private let browser: ICDeviceBrowser
   private var devicesById: [String: ICCameraDevice] = [:]
@@ -96,7 +106,8 @@ final class IccDeviceCoordinator: NSObject {
     self.browser = ICDeviceBrowser()
     super.init()
 
-    log("browser.init", "coordinator constructed")
+    log("browser.init",
+      "coordinator constructed iccBuildTag=\(Self.iccBuildTag)")
     self.browser.delegate = self
     let mask = ICDeviceTypeMask(rawValue:
       ICDeviceTypeMask.camera.rawValue |
@@ -274,7 +285,8 @@ final class IccDeviceCoordinator: NSObject {
   /// first-PTP tax has already been paid. Called by the Dart side from
   /// `IccCameraDiscovery.watch()` onListen / onCancel.
   func setEagerPreOpen(_ enabled: Bool) {
-    log("eager.setEnabled", "enabled=\(enabled)")
+    log("eager.setEnabled",
+      "enabled=\(enabled) iccBuildTag=\(Self.iccBuildTag)")
     eagerPreOpenEnabled = enabled
     if enabled {
       // Re-emit current control-auth status into the diagnostic log
