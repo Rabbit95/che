@@ -217,9 +217,10 @@ Swift 常量 `IccDeviceCoordinator.iccBuildTag`，格式 `YYYY-MM-DD.N`：
 | `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前崩溃安全 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`；`isEnumeratingContent` 遥测。**实测结论：`basicMediaModel` setter 在 iOS 26 存在且成功设置，但仍旧 102s → 确认是噪音；`preheatMetadata` 无 setter；`isEnumeratingContent` 整段阻塞里恒为 0（无用信号）。意外收获：日志抓到相机 USB 重枚举 —— conn#1(365B) 11ms 秒回、catalog 瞬间 100%；conn#2(531B 全量设备) 阻塞 102s、catalog 全程卡 0%。** |
 | `2026-08-20.f` | **P2：怀疑是我们自己的 catalog 抑制导致卡死**。关掉 `responds(to:)` 对 `didAddItems:` 等的抑制（`suppressMediaCatalog=false`），测试「对 catalog 回调答 NO」是否正是让 ICA 空转 ~100s 才服务首条裸 PTP 的原因。撤掉 `.e` 的 KVC 噪音；stub 回调加日志（count + elapsed）。相对 `.d` 干净 baseline 的单一决定性变量 |
 | `2026-08-20.g` | **P3：逆向 Cascable 7.2.2 IPA 后，直接抄它的有线连接**。地面真相：Cascable 用**同一套 ICA**（`ICDeviceBrowser`/`ICCameraDevice`/`requestSendPTPCommand:outData:completion:`），唯二结构差异 = ①用私有 `requestOpenSessionWithOptions:`（空/极简字典）开 session；②它的 `ICCPTPTransport` 跑 `pollForDeviceReadyWithBusyCodes:` —— 一个**容忍 busy 响应码、快速轮询**的就绪探测，而不是发一条命令干等 ICA hold ~100s。故 `.g` = options-open（空字典，`.c` 的猜键是错的）+ busy-code 就绪轮询（对 `0x2019 DeviceBusy`/`0x2003 SessionNotOpen`/`0x2004 InvalidTransactionID`/`-21249` 重试，busy 用 150ms 紧轮询、`-21249` 用退避）。每次发送记 `perSendMs`（决定性：首命令是被 ICA **阻塞 100s**，还是被相机**快速返回 busy**？）。保留 `suppressMediaCatalog=false`。**实测：`perSendMs=78855`，首条裸 PTP 被 ICA 阻塞 79s 后直接返回 OK、零 busy 码 → busy-poll 空转；单参 options 选择器不存在（回退，同 `.c`）→ options-open 从未真正跑过；抑制被洗清** |
-| `2026-08-20.h` | **P4：运行时侦察**。`.g` 证明单参 `requestOpenSessionWithOptions:` 在 iOS 26.5.1 不存在（`.c`/`.g` 都静默回退），而 Cascable 真实 API 是**两参** `requestOpenSessionWithOptions:completion:`。盲调签名未知的私有方法有 block 签名崩溃风险（且可能连日志一起丢），故先做**零风险侦察**：运行时 dump 活体 `ICCameraDevice`/`ICDevice` 方法列表 + 类型编码（`introspect.sel`），拿到确切的开 session 私有选择器供 `.i` 调用。行为不变，仍 ~79s |
+| `2026-08-20.h` | **P4：运行时侦察**。`.g` 证明单参 `requestOpenSessionWithOptions:` 在 iOS 26.5.1 不存在（`.c`/`.g` 都静默回退），而 Cascable 真实 API 是**两参** `requestOpenSessionWithOptions:completion:`。盲调签名未知的私有方法有 block 签名崩溃风险（且可能连日志一起丢），故先做**零风险侦察**：运行时 dump 活体 `ICCameraDevice`/`ICDevice` 方法列表 + 类型编码（`introspect.sel`），拿到确切的开 session 私有选择器供 `.i` 调用。行为不变，仍 ~79s。**实测：`introspect.done matched=23`，确认两参 `requestOpenSessionWithOptions:completion:`（enc `v32@0:8@16@?24`）在 `ICCameraDevice`+`ICDevice` 都存在；`requestEnumerateContentWithOptions:completion:` 是独立 API（暗示 options-open 可能走不触发首阶段枚举的内部路径）** |
+| `2026-08-20.i` | **P5：真正调用 Cascable 的两参 options-open**（`.h` 已确认存在）。改写 `requestOpenSessionLikeCascable`：`perform(_:with:with:)` 调 `requestOpenSessionWithOptions:completion:`，空字典 + `@convention(block) (NSError?) -> Void` completion；completion 回灌 `device:didOpenSessionWithError:`，用 `sessionOpenHandledIds` 按 deviceId 去重（该 open 会同时经 completion 与 delegate 两条路回来）。**不**调用 `requestEnumerateContent`。决定性量测：`perSendMs` 是否从 ~79s 下降 —— 若下降则 options-open 开了个延后枚举的控制 session；若仍 ~79s 则 options-open 单独不够 |
 
-App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f) → `0.3.5+8` (.g) → `0.3.6+9` (.h)
+App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f) → `0.3.5+8` (.g) → `0.3.6+9` (.h) → `0.3.7+10` (.i)
 
 ### P0 测量：拿到日志后怎么读
 
@@ -350,6 +351,32 @@ warmup.done · ok attempts=1 perSendMs=78855 elapsedMs=78855 respCode=0x2001
 - 若整条继承链**一个 options/bringup 开法都没有** → iOS 26 的 `ICCameraDevice` 根本不暴露 Cascable 那套 API（Cascable 可能链接了不同/更老的 ICA，或用了 ICImageCapture 之外的私有栈）→ 转向别的思路（如推迟首条裸 PTP、等 `deviceDidBecomeReady:` 早回调再发）。
 
 `.h` 把「iOS 26 上到底有哪些私有开 session 入口」从猜测变成日志里一份确定的清单。
+
+**`.h` 实测结论（真机日志，2026-08-20，iPhone 17 / iOS 26.5.1 / Z 30）：**
+
+- `introspect.done matched=23`。关键命中：
+  - `class=ICCameraDevice sel=requestOpenSessionWithOptions:completion: enc=v32@0:8@16@?24`（两参：dict@16 + block@?24，返回 void）—— **两参 options-open 在 iOS 26.5.1 确实存在**，`ICDevice` 上也有同名同签名。
+  - `requestEnumerateContentWithOptions:completion:` 是**独立**的内容枚举 API。open 与 enumerate 分家 → 强烈暗示 options-open 可以只开控制 session、把 ~79s 的首阶段存储枚举**延后/跳过**。
+  - 还命中 `requestEnableTethering`/`requestDisableTethering`/`tetheredCaptureEnabled`（ICA 原生 tether 面）与 `autoOpenSession`/`setAutoOpenSession:`/`openSessionPending`（自动开 session 面）—— 作为 `.i` 之后的备选杠杆。
+- 行为仍 ~79s（`perSendMs=78616`），符合预期（本版只侦察不改开法）。
+
+→ 结论：`.i` 直接调这个确认存在的两参选择器，第一次真正跑 Cascable 的 options-open。
+
+### P5：真正调用 Cascable 两参 options-open（`.i`）
+
+`.i` 终于第一次真正执行 Cascable 的开法（`.c`/`.g` 因选择器参数写错都静默回退到无参 open，从未跑过）。
+
+- 改写 `requestOpenSessionLikeCascable`：`responds(to:)` 命中两参 `requestOpenSessionWithOptions:completion:` 后，用 `perform(_:with:with:)` 传**空字典** + `@convention(block) (NSError?) -> Void` completion。
+- 该 open 会**同时**经 completion block 和 `device:didOpenSessionWithError:` delegate 两条路回来 → completion 里把结果回灌 delegate，delegate 顶部用 `sessionOpenHandledIds`（按 deviceId）去重，保证 warmup / pigeon completion 只跑一次。每次 fresh open 开头 `sessionOpenHandledIds.remove(deviceId)` 清位。
+- **不**调用 `requestEnumerateContentWithOptions:` —— 赌的就是「只开控制 session、不主动触发枚举」。
+
+**怎么读 `.i` 日志：**
+
+- 找 `openSession.requestOpenSessionWithOptions ... completion=block (Cascable two-arg)` → 确认这次真的走了两参 options-open（不是回退）。
+- 找 `openSession.optionsCompletion fired ...` → completion block 正常回调（证明 block 签名对，没崩）。
+- **决定性**：`warmup.done ... perSendMs=?`
+  - `perSendMs` 从 ~79s **大幅下降** → options-open 开的是个延后枚举的控制 session，Cascable 的 5s 之谜破解，收工。
+  - 仍 ~79s → options-open **单独不够**。下一步候选：推迟首条裸 PTP、等 `deviceDidBecomeReady:` / catalog 早回调再发；或转 ICA 原生 tether（`requestEnableTethering`）。
 
 ---
 

@@ -73,7 +73,7 @@ final class IccDeviceCoordinator: NSObject {
   ///                  dump the live ICCameraDevice/ICDevice method list + type
   ///                  encodings (introspect.sel) to find the exact open selector
   ///                  to call in `.i`. No behaviour change; still ~79s. See §P4.
-  private static let iccBuildTag: String = "2026-08-20.h"
+  private static let iccBuildTag: String = "2026-08-20.i"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -160,6 +160,11 @@ final class IccDeviceCoordinator: NSObject {
   private var pendingOpenDeviceId: String?
   private var pendingOpenStartedAt: CFAbsoluteTime = 0
   private var pendingOpenWatchdog: DispatchWorkItem?
+  // `.i` — the two-arg `requestOpenSessionWithOptions:completion:` delivers the
+  // open result via BOTH its completion block AND the `didOpenSessionWithError:`
+  // delegate. Dedup so only the first route runs the warmup/completion handling.
+  // Cleared at the start of every fresh open.
+  private var sessionOpenHandledIds: Set<String> = []
   private var catalogObserver: NSKeyValueObservation?
 
   private var pendingCloseCompletion: ((Result<Void, Error>) -> Void)?
@@ -431,6 +436,7 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenCompletions = [completion]
     pendingOpenDeviceId = deviceId
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
+    sessionOpenHandledIds.remove(deviceId)
     camera.delegate = self
 
     // Phase P2 (2026-08-20.f): is OUR OWN catalog suppression the stall?
@@ -532,19 +538,40 @@ final class IccDeviceCoordinator: NSObject {
     on camera: ICCameraDevice, deviceId: String
   ) {
     let cam = camera as NSObject
-    let optionsSel = NSSelectorFromString("requestOpenSessionWithOptions:")
-    if cam.responds(to: optionsSel) {
+    // `.i` — Cascable's REAL open API is the TWO-arg
+    // `requestOpenSessionWithOptions:completion:` (`.h` introspection confirmed
+    // enc=v32@0:8@16@?24 on iOS 26.5.1). The one-arg `requestOpenSessionWithOptions:`
+    // does NOT exist here — both `.c` and `.g` silently fell back to the no-arg open,
+    // so options-open was never actually exercised. This is the first real test.
+    //
+    // The completion block delivers the open result, but ICA ALSO fires the
+    // `device:didOpenSessionWithError:` delegate for the same open. We funnel the
+    // completion into that same delegate and dedup by deviceId so warmup runs once.
+    let optionsCompletionSel = NSSelectorFromString(
+      "requestOpenSessionWithOptions:completion:")
+    if cam.responds(to: optionsCompletionSel) {
       let options: [String: Any] = [:]
+      let completion: @convention(block) (NSError?) -> Void = { [weak self] err in
+        guard let self = self else { return }
+        DispatchQueue.main.async {
+          self.log(
+            "openSession.optionsCompletion",
+            "fired deviceId=\(deviceId) err=\(err?.localizedDescription ?? "nil")"
+          )
+          self.device(camera, didOpenSessionWithError: err)
+        }
+      }
       log(
         "openSession.requestOpenSessionWithOptions",
-        "issued deviceId=\(deviceId) options=<empty> (Cascable-style)"
+        "issued deviceId=\(deviceId) options=<empty> completion=block "
+          + "(Cascable two-arg)"
       )
-      cam.perform(optionsSel, with: options)
+      cam.perform(optionsCompletionSel, with: options, with: completion)
       return
     }
     log(
       "openSession.requestOpenSession",
-      "issued deviceId=\(deviceId) (options API unavailable, fallback)"
+      "issued deviceId=\(deviceId) (two-arg options API unavailable, fallback)"
     )
     camera.requestOpenSession()
   }
@@ -944,6 +971,19 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     let deviceId = pendingOpenDeviceId ?? idFor(device)
     let elapsedMs = Int64(
       (CFAbsoluteTimeGetCurrent() - pendingOpenStartedAt) * 1000)
+
+    // `.i` — the two-arg options-open delivers the result via BOTH its own
+    // completion block AND this delegate. Dedup so warmup/completion handling
+    // runs exactly once per open. Cleared at the start of every fresh open.
+    if sessionOpenHandledIds.contains(deviceId) {
+      log(
+        "openSession.didOpen",
+        "duplicate ignored deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+        elapsedMs: elapsedMs
+      )
+      return
+    }
+    sessionOpenHandledIds.insert(deviceId)
 
     pendingOpenWatchdog?.cancel()
     pendingOpenWatchdog = nil
