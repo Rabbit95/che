@@ -32,7 +32,28 @@ final class IccDeviceCoordinator: NSObject {
   ///   2026-08-20.a — control-only auth + diagnostic log buffering
   ///   2026-08-20.b — try private KVC basicMediaModel/preheatMetadata
   ///   2026-08-20.c — try private requestOpenSessionWithOptions: (dict API)
-  private static let iccBuildTag: String = "2026-08-20.c"
+  ///   2026-08-20.d — REVERT noise KVC/options (b,c); clean baseline +
+  ///                  explicit PTP error domain/code + warmup -21249 retry probe
+  private static let iccBuildTag: String = "2026-08-20.d"
+
+  // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
+  // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
+  // (-21249) rather than being silently blocked-then-completed, ICA is gating on
+  // its internal storage enumeration. We retry with backoff to (a) reveal the
+  // TRUE gate-open time in the logs and (b) potentially clear the session far
+  // sooner than the worst-case ~78 s if the gate opens early.
+  private static let ptpNotAuthorizedCode: Int = -21249
+  // Capped exponential backoff: 1, 2, 4, 8, 8, 8 … seconds. Keeps the worst-case
+  // attempt count (~17 over the deadline) well under the Dart-side 200-line log
+  // ring buffer so early trace lines survive in the copy-log.
+  private static let warmupRetryBaseDelaySeconds: Double = 1.0
+  private static let warmupRetryMaxDelaySeconds: Double = 8.0
+  private static let warmupRetryDeadlineSeconds: Double = 110.0
+
+  private static func warmupRetryDelay(forAttempt attempt: Int) -> Double {
+    let exp = pow(2.0, Double(max(0, attempt - 1)))
+    return min(warmupRetryMaxDelaySeconds, warmupRetryBaseDelaySeconds * exp)
+  }
 
   private let flutterApi: IccPtpFlutterApi
   private let browser: ICDeviceBrowser
@@ -342,104 +363,18 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
     camera.delegate = self
 
-    applyControlModeTuning(on: camera)
+    // Phase P0 revert (2026-08-20.d): the private-KVC control-mode tuning
+    // (`basicMediaModel` / `preheatMetadata` / `ptpEventForwarding`) and the
+    // private `requestOpenSessionWithOptions:` open method were both proven to
+    // be noise / removed on iOS 26 — see docs/ICC-CONNECTION-TUNING.md §3.5–3.6.
+    // We now open with the plain, public API and let the instrumented warmup
+    // (see fireWarmup) measure the actual first-command behaviour.
     installCatalogObserver(on: camera, deviceId: deviceId)
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
-    requestOpenSessionBestAvailable(on: camera, deviceId: deviceId)
-  }
-
-  /// Prefer the PRIVATE `requestOpenSessionWithOptions:` API (found in
-  /// LeoNatan's runtime header dump) over the public no-arg
-  /// `requestOpenSession()` when available. The dictionary lets us
-  /// signal "control-only mode" to ICA at the very first internal
-  /// state-machine step, before it commits to running the full media
-  /// enumeration.
-  ///
-  /// Data point (2026-08-20.b): setting `basicMediaModel=YES` as a
-  /// property AFTER construction dropped warmup from ~78 s to ~30 s,
-  /// but Cascable achieves ~5 s. Hypothesis: the property is checked
-  /// LATE and ICA has partially committed to enumeration by then;
-  /// passing it in the options dict at open time makes ICA see it
-  /// on the very first step.
-  ///
-  /// Silently falls back to the public API if the private one is
-  /// unavailable on this iOS version.
-  private func requestOpenSessionBestAvailable(
-    on camera: ICCameraDevice, deviceId: String
-  ) {
-    let cam = camera as NSObject
-    let optionsSel = NSSelectorFromString("requestOpenSessionWithOptions:")
-    if cam.responds(to: optionsSel) {
-      // Try multiple key spellings — LeoNatan's dump gives us property
-      // names, but Apple's option-dict keys are often prefixed strings.
-      // Sending both spellings costs nothing; ICA reads whichever key
-      // it recognises.
-      let options: [String: Any] = [
-        "basicMediaModel": true,
-        "ICCameraDeviceBasicMediaModel": true,
-        "preheatMetadata": false,
-        "ICCameraDevicePreheatMetadata": false,
-        "ptpEventForwarding": true,
-      ]
-      let keysCsv = options.keys.sorted().joined(separator: ",")
-      log(
-        "openSession.requestOpenSessionWithOptions",
-        "issued deviceId=\(deviceId) options=\(keysCsv)"
-      )
-      cam.perform(optionsSel, with: options)
-      return
-    }
-    log(
-      "openSession.requestOpenSession",
-      "issued deviceId=\(deviceId) (options API unavailable, fallback)"
-    )
+    log("openSession.requestOpenSession", "issued deviceId=\(deviceId)")
     camera.requestOpenSession()
-  }
-
-  /// Set PRIVATE / undocumented `ICCameraDevice` properties (per
-  /// LeoNatan's iOS runtime header dump) that appear to control ICA's
-  /// media enumeration behaviour on session open. Setting these to
-  /// "control-only mode" values is a strong lead for why competitor
-  /// apps like Cascable and 影控台 connect near-instantly even on full
-  /// SD cards — Cascable's public SDK docs literally split camera
-  /// capabilities into `RemoteShooting` vs `FilesystemAccess`, which
-  /// mirrors the `basicMediaModel` / `preheatMetadata` dichotomy.
-  ///
-  /// APP STORE NOTE: static analysis is signature-based, not runtime
-  /// lookup-based. `setValue(_:forKey:)` with string keys reads and
-  /// writes via the ObjC runtime and doesn't leave a compiled symbol
-  /// reference. Cascable is App-Store-shipped and presumably uses the
-  /// same technique. If Apple's review starts using dynamic analysis
-  /// or the property names change in a future iOS, the `responds(to:)`
-  /// guards silently skip — no crash, just old (slow) behaviour.
-  ///
-  /// The properties are set BEFORE `requestOpenSession()` so ICA sees
-  /// them on the very first internal state-machine step.
-  private func applyControlModeTuning(on camera: ICCameraDevice) {
-    let cam = camera as NSObject
-    let preheatSetter = NSSelectorFromString("setPreheatMetadata:")
-    if cam.responds(to: preheatSetter) {
-      cam.setValue(false, forKey: "preheatMetadata")
-      log("kvc.tuning", "preheatMetadata=NO applied")
-    } else {
-      log("kvc.tuning", "preheatMetadata setter unavailable on this iOS")
-    }
-    let basicSetter = NSSelectorFromString("setBasicMediaModel:")
-    if cam.responds(to: basicSetter) {
-      cam.setValue(true, forKey: "basicMediaModel")
-      log("kvc.tuning", "basicMediaModel=YES applied")
-    } else {
-      log("kvc.tuning", "basicMediaModel setter unavailable on this iOS")
-    }
-    let ptpForwardSetter = NSSelectorFromString("setPtpEventForwarding:")
-    if cam.responds(to: ptpForwardSetter) {
-      cam.setValue(true, forKey: "ptpEventForwarding")
-      log("kvc.tuning", "ptpEventForwarding=YES applied")
-    } else {
-      log("kvc.tuning", "ptpEventForwarding setter unavailable on this iOS")
-    }
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
@@ -698,9 +633,16 @@ final class IccDeviceCoordinator: NSObject {
     } ?? -1
 
     if let error = error {
+      // Log the raw domain+code, not just localizedDescription. This is the
+      // decisive P0 signal: code=-21249 (ICReturnPTPNotAuthorizedToSendCommand)
+      // means ICA is gating on its internal storage enumeration (auth-gate
+      // model); any other code / a blocked-then-OK completion means the delay
+      // is pipe contention, not an auth gate. See docs/ICC-CONNECTION-TUNING.md.
+      let nsErr = error as NSError
+      let notAuth = nsErr.code == Self.ptpNotAuthorizedCode
       log(
         "command.error",
-        "opcode=0x\(String(opcode, radix: 16)) elapsedMs=\(elapsedMs) err=\(error.localizedDescription)",
+        "opcode=0x\(String(opcode, radix: 16)) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code)\(notAuth ? " (PTPNotAuthorized/-21249)" : "") err=\(error.localizedDescription)",
         error: true,
         elapsedMs: elapsedMs
       )
@@ -889,15 +831,33 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   /// Fire the warmup `GetDeviceInfo` PTP command so Apple's ICA
   /// internal enumeration runs in the background before Dart sees a
   /// session-ready callback. Marks `warmupCompletedDeviceIds` and
-  /// releases all `pendingOpenCompletions` on completion (success or
-  /// failure — the session IS open regardless, and Dart's own commands
-  /// will surface their own errors).
+  /// releases all `pendingOpenCompletions` on completion.
+  ///
+  /// Phase P0 (2026-08-20.d): if the command is REJECTED with
+  /// `-21249` (ICReturnPTPNotAuthorizedToSendCommand) rather than
+  /// blocked-then-completed, ICA is gating on its internal storage
+  /// enumeration. We retry with backoff up to `warmupRetryDeadlineSeconds`
+  /// so the log reveals the TRUE gate-open time, and so the session may
+  /// clear far sooner than the worst-case cold-start tax if the gate
+  /// happens to open early.
   private func fireWarmup(deviceId: String, camera: ICCameraDevice) {
     guard !warmupInProgress else { return }
     warmupInProgress = true
     let warmupStart = CFAbsoluteTimeGetCurrent()
     log("warmup.start",
       "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId)")
+    sendWarmupProbe(
+      deviceId: deviceId, camera: camera, attempt: 1, warmupStart: warmupStart)
+  }
+
+  /// One warmup GetDeviceInfo attempt. Recurses (with backoff) on `-21249`
+  /// until the gate opens or `warmupRetryDeadlineSeconds` elapses.
+  private func sendWarmupProbe(
+    deviceId: String,
+    camera: ICCameraDevice,
+    attempt: Int,
+    warmupStart: CFAbsoluteTime
+  ) {
     sendRawPTP(
       camera: camera,
       opcode: 0x1001, // GetDeviceInfo
@@ -906,20 +866,58 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       outData: nil
     ) { [weak self] result in
       guard let self = self else { return }
-      self.warmupInProgress = false
       let elapsedMs = Int64(
         (CFAbsoluteTimeGetCurrent() - warmupStart) * 1000)
+
+      // Retry ONLY on the auth-gate rejection, and only while camera is still
+      // attached, still the active pending device, and under the deadline.
+      if case .failure(let e) = result,
+        (e as NSError).code == Self.ptpNotAuthorizedCode,
+        camera.hasOpenSession,
+        self.pendingOpenDeviceId == deviceId,
+        Double(elapsedMs) / 1000.0 < Self.warmupRetryDeadlineSeconds
+      {
+        let delay = Self.warmupRetryDelay(forAttempt: attempt)
+        self.log(
+          "warmup.retry",
+          "deviceId=\(deviceId) attempt=\(attempt) elapsedMs=\(elapsedMs) code=-21249 retrying in \(delay)s",
+          elapsedMs: elapsedMs
+        )
+        DispatchQueue.main.asyncAfter(
+          deadline: .now() + delay
+        ) { [weak self] in
+          guard let self = self else { return }
+          // Bail out if the open was resolved/torn down while we waited
+          // (e.g. unplug). Clear the in-progress flag so a later reconnect
+          // can warm up again — otherwise it leaks `true` forever.
+          guard self.warmupInProgress,
+            self.pendingOpenDeviceId == deviceId,
+            camera.hasOpenSession
+          else {
+            self.warmupInProgress = false
+            return
+          }
+          self.sendWarmupProbe(
+            deviceId: deviceId, camera: camera,
+            attempt: attempt + 1, warmupStart: warmupStart)
+        }
+        return
+      }
+
+      // Terminal: success, non-auth failure, or deadline reached.
+      self.warmupInProgress = false
       switch result {
       case .success(let r):
         self.log(
           "warmup.done",
-          "ok elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
+          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
           elapsedMs: elapsedMs
         )
       case .failure(let e):
+        let nsErr = e as NSError
         self.log(
           "warmup.done",
-          "err elapsedMs=\(elapsedMs) err=\(e.localizedDescription)",
+          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription)",
           error: true,
           elapsedMs: elapsedMs
         )
