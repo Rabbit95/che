@@ -12,9 +12,16 @@ import ImageCaptureCore
 ///   the system prompts "允许有线配件". Denying it means `ICDeviceBrowser`
 ///   never fires `didAdd`, so from Dart the discovery list stays empty
 ///   with no error. Recovery is user-side: 设置 → 隐私与安全 → 有线配件.
-///   We deliberately do NOT call the newer
-///   `requestControlAuthorization` API — it is iOS 18-only and the
-///   system dialog already appears without it on plug-in.
+/// - **`ICDeviceBrowser.requestControlAuthorization`**: iOS 18+ API for
+///   requesting raw-PTP-control access WITHOUT requesting the
+///   media-browsing (`contentsAuthorization`) access. Empirical
+///   observation is that ICA runs its internal storage enumeration
+///   (GetStorageIDs / GetObjectHandles — the ~78 s tax on the first
+///   `requestSendPTPCommand`) only when it thinks the client wants
+///   media browsing. We call `requestControlAuthorization` in the
+///   coordinator's init and DELIBERATELY NEVER call
+///   `requestContentsAuthorization`, so that ICA classifies this app as
+///   control-only and (hopefully) skips the enumeration entirely.
 /// - **`ICCameraDevice.mediaFiles`**: known-broken on iPadOS 13.4+ and
 ///   iOS 18+ (returns empty even when files exist — rdar://FB7593726).
 ///   We never touch it; browsing goes through PTP `GetObjectHandles`

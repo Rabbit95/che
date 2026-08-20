@@ -105,6 +105,37 @@ final class IccDeviceCoordinator: NSObject {
     if let mask = mask {
       self.browser.browsedDeviceTypeMask = mask
     }
+
+    // iOS 14+ gates ICDeviceBrowser access with TWO orthogonal
+    // authorization channels:
+    //   • requestContentsAuthorization — grants "browse files on the
+    //     camera" access. Prompting for this signals to ICA that the
+    //     app wants the media catalog, which appears to be why ICA
+    //     eagerly runs GetStorageIDs / GetObjectHandles on every
+    //     session open — that is the ~78 s tax we've been fighting.
+    //   • requestControlAuthorization (iOS 18+) — grants "raw PTP
+    //     control" access. In principle a control-only client has no
+    //     business needing the media catalog, and ICA may skip the
+    //     internal enumeration.
+    //
+    // We call ONLY the control variant, and never the contents variant.
+    // Hypothesis: control-only auth is how competitor apps achieve
+    // near-instant cold-start USB connect on populated SD cards.
+    // Empirical verification on-device required.
+    if #available(iOS 18.0, *) {
+      log("auth.control.request",
+        "requesting control-only authorization (never contents)")
+      ICDeviceBrowser.requestControlAuthorization { [weak self] status in
+        self?.log(
+          "auth.control.result",
+          "status=\(status.rawValue) (0=notDetermined 1=restricted 2=denied 3=authorized)"
+        )
+      }
+    } else {
+      log("auth.control.request",
+        "iOS<18 — control-auth API unavailable, falling back to implicit auth")
+    }
+
     log("browser.start", "ICDeviceBrowser.start()")
     self.browser.start()
   }
