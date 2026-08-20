@@ -225,6 +225,22 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 - **完全没有 `-21249`**，只有 `warmup.start` 后隔很久才 `warmup.done ok respCode=0x2001` → 是**管道争用**模型（ICA 没拒绝，只是占着 USB 管道跑枚举）。此时授权门那条线彻底死，主攻方向转向 P2（缩小文件树）或 P3（Wi-Fi 绕开 ICA）。
 - **`catalog.progress percent=...`**：整个等待窗口里若百分比一直 0 到最后才跳 → 卡在 Phase 1（storage handle 枚举，catalog 之前）；若缓慢 0→100 → Phase 2 仍在跑，`respondsToSelector` 门控没生效。
 
+### P0 实测结论（`.d` 真机日志，2026-08-20，iPhone 17 / iOS 26.5.1 / Z 30 / 满卡）
+
+**一锤定音：确认是「管道争用 / 首个 PTP 命令税」模型，授权门模型被证伪。** 决定性证据：
+
+- `warmup.done · ok attempts=1 elapsedMs=96737 respCode=0x2001` —— 首个 GetDeviceInfo（tx=1）被 ICA hold 住 **96.7s** 后返回 **OK 0x2001**（不是拒绝）。
+- 全日志 **零** `-21249`、**零** `command.error`、**零** `warmup.retry`，`attempts=1` —— ICA 从未拒绝命令，重试探针一次都没触发。
+- 第二个 GetDeviceInfo（tx=2）只花 **0.8s**；随后 OpenSession/ChangeApplicationMode/DeviceReady 全部 ≤1s。**税只在首命令付一次。**
+- `catalog.progress` 在整个 94s 阻塞窗口里一直 **0%**，阻塞释放后 ~200ms 内才跳到 20% —— 即 94s 花在 catalog **之前**的 Phase 1（GetStorageIDs/GetObjectHandles 内部枚举），它 gate 住 app 的首个 PTP 命令。
+- 总连接 ~95s，其中「首命令之后的一切」合计 ~1s。
+
+**推论（重要且不乐观）：** 走 USB / ICA 时，满卡 Z 30 的首命令阻塞 ~90s 无法用 app 侧任何手段消除 —— 所有 PTP 命令（含开启控制的 ChangeApplicationMode）都排在完整 catalog 之后，这 94s 内相机不接受任何控制命令。warmup 探针不省时间，只是给这笔税贴了标签。真正的解法只有两条：**(a) 减少卡上文件（Phase 1 无东西可枚举 → 秒开，已被「拔卡 <1s」佐证）**，或 **(b) 换传输层（Wi-Fi PTP-IP 绕开 ICA，P3）**。
+
+**Cascable 对照存疑：** 研究表明 Cascable 的 USB 连接**也走 ImageCaptureCore/PTP**（见 https://cascable.se/help/wired-cameras/ ），因此附录 B 里「~5s + Apple 私下支持」的说法**不可靠**，很可能是小卡/空卡或 Wi-Fi 下的测量。待验证实验：用 Cascable Studio 连**同一张满卡** Z 30 冷启动计时 —— 若也 ~90s，则我们与 Cascable 在满卡 USB 下本就同速。
+
+**下一步（零代码，需真机配合）：** ① 换一张近空卡冷启动连接计时（预期秒开，确认文件数因果）；② Cascable 连同一张满卡计时（消歧 Cascable 是否有我们没找到的招）。这两个数据点决定 P2（缩文件树）vs P3（Wi-Fi）的主攻方向。
+
 ---
 
 ## 附录 A：Apple ICA 两阶段枚举模型（推断）
@@ -272,5 +288,6 @@ didOpenSessionWithError(nil)  ← 1ms 内触发（session 建立）
 | + Phase B v4 KVC basicMediaModel（第 2 次） | **29,919** | 一度让人以为找到银弹 |
 | + Phase B v4 KVC basicMediaModel（第 3 次） | **191,201** | 比 baseline 慢 2.4 倍 |
 | Phase B v5 options API attempt | 191,201 (fallback) | iOS 26 移除了此方法 |
-| **Cascable Studio（对照）** | **~5,000** | **公开 API + Apple 私下支持** |
+| **`.d` 干净 baseline（实测）** | **96,737** | **零 -21249，attempts=1，OK 0x2001；管道争用模型确认；tx=2 仅 0.8s** |
+| **Cascable Studio（对照，存疑）** | ~5,000？ | Cascable USB 也走 ICA/PTP；此数很可能是小卡/Wi-Fi，待同满卡 A/B 复核 |
 | **拔掉 SD 卡（对照）** | **<1,000** | Phase 1 无东西可枚举 |
