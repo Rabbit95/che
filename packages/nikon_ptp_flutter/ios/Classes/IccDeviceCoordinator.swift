@@ -34,7 +34,10 @@ final class IccDeviceCoordinator: NSObject {
   ///   2026-08-20.c — try private requestOpenSessionWithOptions: (dict API)
   ///   2026-08-20.d — REVERT noise KVC/options (b,c); clean baseline +
   ///                  explicit PTP error domain/code + warmup -21249 retry probe
-  private static let iccBuildTag: String = "2026-08-20.d"
+  ///   2026-08-20.e — P1 control-only probe: crash-guarded KVC
+  ///                  basicMediaModel=true / preheatMetadata=false BEFORE open
+  ///                  + isEnumeratingContent telemetry (pre-open/catalog/warmup)
+  private static let iccBuildTag: String = "2026-08-20.e"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -363,18 +366,79 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
     camera.delegate = self
 
-    // Phase P0 revert (2026-08-20.d): the private-KVC control-mode tuning
-    // (`basicMediaModel` / `preheatMetadata` / `ptpEventForwarding`) and the
-    // private `requestOpenSessionWithOptions:` open method were both proven to
-    // be noise / removed on iOS 26 — see docs/ICC-CONNECTION-TUNING.md §3.5–3.6.
-    // We now open with the plain, public API and let the instrumented warmup
-    // (see fireWarmup) measure the actual first-command behaviour.
+    // Phase P1 (2026-08-20.e): control-only open probe. The `.d` on-device
+    // log proved the ~96.7 s block is ICA's Phase-1 whole-card storage
+    // enumeration (GetStorageIDs/GetObjectHandles) gating our first raw PTP
+    // command — NOT the -21249 auth-gate (warmup returned OK 0x2001, never
+    // rejected). Cascable connects to the SAME card in ~5 s, so a fast,
+    // enumeration-skipping open path demonstrably exists on iOS 26.
+    //
+    // We now try, BEFORE opening, to switch ICCameraDevice into its minimal
+    // "control-only" media model via undocumented KVC flags:
+    //   basicMediaModel = true   → use the minimal media model (skip catalog)
+    //   preheatMetadata = false  → do not pre-walk per-file metadata
+    // Both setters are crash-guarded (see trySetPrivate) so a build that
+    // lacks the key silently skips instead of raising NSUnknownKeyException.
+    //
+    // Regardless of whether the KVC lands, we log `isEnumeratingContent`
+    // (ICA's Phase-1 signal) at open, in the catalog observer, and around
+    // warmup — that telemetry alone settles "was Phase 1 skipped?" on the
+    // next real-device log. See docs/ICC-CONNECTION-TUNING.md §P1.
+    trySetPrivate(camera, key: "basicMediaModel", value: true, deviceId: deviceId)
+    trySetPrivate(camera, key: "preheatMetadata", value: false, deviceId: deviceId)
+    log(
+      "openSession.enumState",
+      "phase=preOpen isEnumeratingContent=\(readPrivateFlag(camera, key: "isEnumeratingContent")) deviceId=\(deviceId)"
+    )
+
     installCatalogObserver(on: camera, deviceId: deviceId)
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
     log("openSession.requestOpenSession", "issued deviceId=\(deviceId)")
     camera.requestOpenSession()
+  }
+
+  /// Crash-guarded private-KVC setter. ICCameraDevice exposes several
+  /// undocumented control-mode flags (`basicMediaModel`, `preheatMetadata`,
+  /// `enumerationOrder`, …) that exist only on some iOS builds. Calling
+  /// `setValue(_:forKey:)` for a key without a matching ObjC setter raises an
+  /// NSUnknownKeyException that Swift cannot `catch`, so we gate on the
+  /// derived setter selector first and quietly skip (logging the miss) when
+  /// it is absent. Returns whether the value was actually applied.
+  @discardableResult
+  private func trySetPrivate(
+    _ camera: ICCameraDevice, key: String, value: Any, deviceId: String
+  ) -> Bool {
+    let setter = "set\(key.prefix(1).uppercased())\(key.dropFirst()):"
+    guard camera.responds(to: NSSelectorFromString(setter)) else {
+      log(
+        "openSession.kvc",
+        "skip key=\(key) reason=no_setter deviceId=\(deviceId)"
+      )
+      return false
+    }
+    camera.setValue(value, forKey: key)
+    log(
+      "openSession.kvc",
+      "set key=\(key) value=\(value) deviceId=\(deviceId)"
+    )
+    return true
+  }
+
+  /// Read a private KVC flag if its getter selector exists, else return
+  /// "unknown" rather than crashing. Used to instrument
+  /// `isEnumeratingContent` — ICA's Phase-1 storage-walk signal — so the log
+  /// records whether the enumeration was skipped even on builds where the
+  /// property is unavailable.
+  private func readPrivateFlag(
+    _ camera: ICCameraDevice, key: String
+  ) -> String {
+    guard camera.responds(to: NSSelectorFromString(key)) else {
+      return "unknown"
+    }
+    let value = camera.value(forKey: key)
+    return "\(value ?? "nil")"
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
@@ -457,7 +521,7 @@ final class IccDeviceCoordinator: NSObject {
         : Int64((CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
       self.log(
         "catalog.progress",
-        "deviceId=\(deviceId) percent=\(pct)",
+        "deviceId=\(deviceId) percent=\(pct) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
         elapsedMs: elapsedMs
       )
       self.emitProgress(deviceId: deviceId, phase: "catalog", percent: pct)
@@ -845,7 +909,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     warmupInProgress = true
     let warmupStart = CFAbsoluteTimeGetCurrent()
     log("warmup.start",
-      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId)")
+      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId) isEnumeratingContent=\(readPrivateFlag(camera, key: "isEnumeratingContent"))")
     sendWarmupProbe(
       deviceId: deviceId, camera: camera, attempt: 1, warmupStart: warmupStart)
   }
@@ -910,14 +974,14 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       case .success(let r):
         self.log(
           "warmup.done",
-          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
+          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16)) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
           elapsedMs: elapsedMs
         )
       case .failure(let e):
         let nsErr = e as NSError
         self.log(
           "warmup.done",
-          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription)",
+          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
           error: true,
           elapsedMs: elapsedMs
         )

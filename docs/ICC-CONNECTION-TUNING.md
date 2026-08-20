@@ -214,8 +214,9 @@ Swift 常量 `IccDeviceCoordinator.iccBuildTag`，格式 `YYYY-MM-DD.N`：
 | `2026-08-20.b` | 试 KVC `basicMediaModel` / `preheatMetadata` / `ptpEventForwarding` |
 | `2026-08-20.c` | 试私有 `requestOpenSessionWithOptions:` 方法（iOS 26 已移除，fallback） |
 | `2026-08-20.d` | **撤掉 .b/.c 噪音代码**，回到干净 public-API baseline；`command.error` 显式记录 `domain`/`code`（决定性区分 `-21249` 授权门 vs 阻塞后成功）；warmup 加 `-21249` 有界重试探针（指数退避 1→8s，110s 上限，~17 次封顶以不冲爆 200 行日志环）揭示真实门开启时间 |
+| `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前用**崩溃安全**的 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`（`responds(to: set<Key>:)` 门控，无 setter 则静默跳过并记 `openSession.kvc skip`）尝试切到最小媒体模型；同时新增 `isEnumeratingContent`（ICA Phase-1 信号）遥测，在 **preOpen / catalog.progress / warmup.start / warmup.done** 四处记录 → 无论 KVC 是否生效，下一份真机日志都能一锤定音「Phase 1 到底跳没跳」 |
 
-App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d)
+App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e)
 
 ### P0 测量：拿到日志后怎么读
 
@@ -248,6 +249,21 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 - **H3：** 真正的 gate 不是「catalog 完成」，而是别的可提前满足的条件。
 
 **下一步：** ① 研究 spike：ICA 能否「开 session 做控制但不等 content catalog」+ Cascable 具体做法；② 零代码真机复核：**拔掉 SD 卡**以无卡态跑 `.d` 版连接计时（预期 <1s，与历史「拔卡 <1s」对齐，确认自身下限 —— 但这已知，优先级低于 ①）。
+
+### P1 control-only 探针（`.e`，私有 API 已授权）
+
+用户确认 **不上架 / 自用侧载** → 私有 API 解禁。`.e` 是一次**单变量**实验，在 `.d` 干净 baseline 上只加两件事：
+
+1. **开 session 前**尝试把 `ICCameraDevice` 切进「仅控制」最小媒体模型：崩溃安全 KVC 设 `basicMediaModel=true`（用最小媒体模型，跳过 catalog）+ `preheatMetadata=false`（不预取逐文件元数据）。两个 setter 都先用 `responds(to: NSSelectorFromString("set<Key>:"))` 门控 —— 该 iOS 构建若无此私有键，静默跳过并记 `openSession.kvc skip key=... reason=no_setter`，绝不抛 `NSUnknownKeyException`。
+2. **`isEnumeratingContent` 遥测**（读取同样崩溃安全，无 getter 记 `unknown`）：在 `openSession.enumState phase=preOpen` / `catalog.progress` / `warmup.start` / `warmup.done` 四处打点。
+
+**这份日志怎么读（决定性）：**
+
+- `basicMediaModel=true` 生效且有效 → `warmup.done ok elapsedMs` 应从 ~96s **骤降**，且全程 `isEnumeratingContent=0/false` → Phase-1 被跳过，H2 成立，主攻方向锁定「control-only open」。
+- KVC 记 `openSession.kvc skip ... no_setter` → iOS 26 无此私有键，`basicMediaModel` 路死；但 `isEnumeratingContent` 若在阻塞窗口内为 `1/true`、释放后转 `0/false`，就**独立坐实** ~94s 确系 Phase-1 枚举（不再依赖 `catalog.progress` 的 200ms 间接推断），H1 优先级升到最高，转攻「裸 PTP 透传 gate 在 catalog 之后」。
+- KVC 生效但**耗时不变**（仍 ~96s）→ `basicMediaModel` 是噪音（复现 `.b` 的不稳定），彻底放弃私有 KVC，全力 H1/H3。
+
+无论哪条分支，`.e` 都把「Phase 1 有没有被跳过」从推断变成日志里的一个布尔值。
 
 ---
 
