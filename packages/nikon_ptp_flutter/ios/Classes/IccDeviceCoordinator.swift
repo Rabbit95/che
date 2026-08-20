@@ -31,7 +31,8 @@ final class IccDeviceCoordinator: NSObject {
   /// Changelog kept short — one line per bump:
   ///   2026-08-20.a — control-only auth + diagnostic log buffering
   ///   2026-08-20.b — try private KVC basicMediaModel/preheatMetadata
-  private static let iccBuildTag: String = "2026-08-20.b"
+  ///   2026-08-20.c — try private requestOpenSessionWithOptions: (dict API)
+  private static let iccBuildTag: String = "2026-08-20.c"
 
   private let flutterApi: IccPtpFlutterApi
   private let browser: ICDeviceBrowser
@@ -346,9 +347,52 @@ final class IccDeviceCoordinator: NSObject {
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
+    requestOpenSessionBestAvailable(on: camera, deviceId: deviceId)
+  }
+
+  /// Prefer the PRIVATE `requestOpenSessionWithOptions:` API (found in
+  /// LeoNatan's runtime header dump) over the public no-arg
+  /// `requestOpenSession()` when available. The dictionary lets us
+  /// signal "control-only mode" to ICA at the very first internal
+  /// state-machine step, before it commits to running the full media
+  /// enumeration.
+  ///
+  /// Data point (2026-08-20.b): setting `basicMediaModel=YES` as a
+  /// property AFTER construction dropped warmup from ~78 s to ~30 s,
+  /// but Cascable achieves ~5 s. Hypothesis: the property is checked
+  /// LATE and ICA has partially committed to enumeration by then;
+  /// passing it in the options dict at open time makes ICA see it
+  /// on the very first step.
+  ///
+  /// Silently falls back to the public API if the private one is
+  /// unavailable on this iOS version.
+  private func requestOpenSessionBestAvailable(
+    on camera: ICCameraDevice, deviceId: String
+  ) {
+    let cam = camera as NSObject
+    let optionsSel = NSSelectorFromString("requestOpenSessionWithOptions:")
+    if cam.responds(to: optionsSel) {
+      // Try multiple key spellings — LeoNatan's dump gives us property
+      // names, but Apple's option-dict keys are often prefixed strings.
+      // Sending both spellings costs nothing; ICA reads whichever key
+      // it recognises.
+      let options: [String: Any] = [
+        "basicMediaModel": true,
+        "ICCameraDeviceBasicMediaModel": true,
+        "preheatMetadata": false,
+        "ICCameraDevicePreheatMetadata": false,
+        "ptpEventForwarding": true,
+      ]
+      log(
+        "openSession.requestOpenSessionWithOptions",
+        "issued deviceId=\(deviceId) options=\(options.keys.sorted().joined(separator: \",\"))"
+      )
+      cam.perform(optionsSel, with: options)
+      return
+    }
     log(
       "openSession.requestOpenSession",
-      "issued deviceId=\(deviceId)"
+      "issued deviceId=\(deviceId) (options API unavailable, fallback)"
     )
     camera.requestOpenSession()
   }
