@@ -277,6 +277,20 @@ final class IccDeviceCoordinator: NSObject {
     log("eager.setEnabled", "enabled=\(enabled)")
     eagerPreOpenEnabled = enabled
     if enabled {
+      // Re-emit current control-auth status into the diagnostic log
+      // stream. The initial `auth.control.request` in init() fires
+      // before Dart-side listeners exist, so its result gets dropped.
+      // Calling requestControlAuthorization here is cheap and
+      // idempotent (it does NOT re-prompt if already granted), and it
+      // guarantees the status lands in the in-app copy log.
+      if #available(iOS 18.0, *) {
+        self.browser.requestControlAuthorization { [weak self] status in
+          self?.log(
+            "auth.control.status",
+            "status=\(status.rawValue) (0=notDetermined 1=restricted 2=denied 3=authorized)"
+          )
+        }
+      }
       // Kick off eager pre-open for devices the browser already surfaced
       // before eager was turned on (e.g. camera was plugged in before
       // Discovery mounted).
