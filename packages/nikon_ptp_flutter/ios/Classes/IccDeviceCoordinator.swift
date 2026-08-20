@@ -36,8 +36,16 @@ final class IccDeviceCoordinator: NSObject {
   ///                  explicit PTP error domain/code + warmup -21249 retry probe
   ///   2026-08-20.e — P1 control-only probe: crash-guarded KVC
   ///                  basicMediaModel=true / preheatMetadata=false BEFORE open
-  ///                  + isEnumeratingContent telemetry (pre-open/catalog/warmup)
-  private static let iccBuildTag: String = "2026-08-20.e"
+  ///                  + isEnumeratingContent telemetry (pre-open/catalog/warmup).
+  ///                  RESULT: basicMediaModel setter exists but is noise (still
+  ///                  102s); preheatMetadata absent; isEnumeratingContent stuck 0
+  ///                  through the block. Also caught camera RE-ENUMERATION
+  ///                  (365B fast conn#1 vs 531B slow conn#2).
+  ///   2026-08-20.f — P2: disable OUR catalog-selector suppression
+  ///                  (suppressMediaCatalog=false) to test if answering NO to
+  ///                  didAddItems: is what makes ICA busy-wait ~100s before the
+  ///                  first raw PTP. Reverts .e KVC noise; logs catalog delivery.
+  private static let iccBuildTag: String = "2026-08-20.f"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -213,9 +221,18 @@ final class IccDeviceCoordinator: NSObject {
   // this override is a no-op behaviourally (the methods still exist as
   // no-op stubs). Cost of trying: zero. Payoff if it works: instant
   // connect regardless of SD-card contents.
+  // Phase P2 (2026-08-20.f): master switch for the catalog-selector
+  // suppression below. Set FALSE to let ICA deliver catalog callbacks
+  // normally — testing the hypothesis that answering NO to `didAddItems:`
+  // et al. is what makes ICA busy-wait ~100 s before servicing our first
+  // raw PTP command. When false, `responds(to:)` behaves like the vanilla
+  // superclass and the stub delegate methods (which now log) fire.
+  private static let suppressMediaCatalog: Bool = false
+
   override func responds(to aSelector: Selector!) -> Bool {
     guard let sel = aSelector else { return super.responds(to: aSelector) }
-    if Self.mediaCatalogSelectorNames.contains(NSStringFromSelector(sel)) {
+    if Self.suppressMediaCatalog,
+      Self.mediaCatalogSelectorNames.contains(NSStringFromSelector(sel)) {
       return false
     }
     return super.responds(to: aSelector)
@@ -366,79 +383,38 @@ final class IccDeviceCoordinator: NSObject {
     pendingOpenStartedAt = CFAbsoluteTimeGetCurrent()
     camera.delegate = self
 
-    // Phase P1 (2026-08-20.e): control-only open probe. The `.d` on-device
-    // log proved the ~96.7 s block is ICA's Phase-1 whole-card storage
-    // enumeration (GetStorageIDs/GetObjectHandles) gating our first raw PTP
-    // command — NOT the -21249 auth-gate (warmup returned OK 0x2001, never
-    // rejected). Cascable connects to the SAME card in ~5 s, so a fast,
-    // enumeration-skipping open path demonstrably exists on iOS 26.
+    // Phase P2 (2026-08-20.f): is OUR OWN catalog suppression the stall?
     //
-    // We now try, BEFORE opening, to switch ICCameraDevice into its minimal
-    // "control-only" media model via undocumented KVC flags:
-    //   basicMediaModel = true   → use the minimal media model (skip catalog)
-    //   preheatMetadata = false  → do not pre-walk per-file metadata
-    // Both setters are crash-guarded (see trySetPrivate) so a build that
-    // lacks the key silently skips instead of raising NSUnknownKeyException.
+    // `.e` disproved the private-KVC avenue: `basicMediaModel=true`'s setter
+    // DOES exist on iOS 26 and applied cleanly, yet the slow open still ate
+    // 102 s — confirmed noise. `preheatMetadata` has no setter; and the
+    // `isEnumeratingContent` flag read 0 through the ENTIRE 102 s block, so
+    // the tax is invisible to both of ICA's content-progress signals.
     //
-    // Regardless of whether the KVC lands, we log `isEnumeratingContent`
-    // (ICA's Phase-1 signal) at open, in the catalog observer, and around
-    // warmup — that telemetry alone settles "was Phase 1 skipped?" on the
-    // next real-device log. See docs/ICC-CONNECTION-TUNING.md §P1.
-    trySetPrivate(camera, key: "basicMediaModel", value: true, deviceId: deviceId)
-    trySetPrivate(camera, key: "preheatMetadata", value: false, deviceId: deviceId)
-    log(
-      "openSession.enumState",
-      "phase=preOpen isEnumeratingContent=\(readPrivateFlag(camera, key: "isEnumeratingContent")) deviceId=\(deviceId)"
-    )
-
+    // But the `.e` log also caught the camera RE-ENUMERATING (didRemove →
+    // didAdd) with two different GetDeviceInfo payloads:
+    //   • conn#1 (365 B): warmup returned in 11 ms, catalog jumped 0→100 %.
+    //   • conn#2 (531 B, full device): warmup blocked 102 s, catalog STUCK
+    //     at 0 % the whole time.
+    // The only structural difference on conn#2 is that ICA's catalog never
+    // advances — and we have been actively HIDING the catalog delegate
+    // selectors via `responds(to:)`. Prime suspect now: ICA queues our first
+    // raw `requestSendPTPCommand` behind catalog delivery it cannot make
+    // (because we answer NO to `didAddItems:` et al.), busy-waits to some
+    // internal timeout (~100 s), THEN services the PTP.
+    //
+    // `.f` tests exactly that by DISABLING our suppression
+    // (`suppressMediaCatalog = false`), so ICA can deliver catalog callbacks
+    // normally. The stub delegate methods now LOG (count + elapsed) so the
+    // next real-device log shows whether catalog advances and whether the
+    // first-PTP tax collapses. Single decisive variable vs the clean `.d`
+    // baseline; `.e`'s KVC noise is removed. See docs §P2.
     installCatalogObserver(on: camera, deviceId: deviceId)
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
     log("openSession.requestOpenSession", "issued deviceId=\(deviceId)")
     camera.requestOpenSession()
-  }
-
-  /// Crash-guarded private-KVC setter. ICCameraDevice exposes several
-  /// undocumented control-mode flags (`basicMediaModel`, `preheatMetadata`,
-  /// `enumerationOrder`, …) that exist only on some iOS builds. Calling
-  /// `setValue(_:forKey:)` for a key without a matching ObjC setter raises an
-  /// NSUnknownKeyException that Swift cannot `catch`, so we gate on the
-  /// derived setter selector first and quietly skip (logging the miss) when
-  /// it is absent. Returns whether the value was actually applied.
-  @discardableResult
-  private func trySetPrivate(
-    _ camera: ICCameraDevice, key: String, value: Any, deviceId: String
-  ) -> Bool {
-    let setter = "set\(key.prefix(1).uppercased())\(key.dropFirst()):"
-    guard camera.responds(to: NSSelectorFromString(setter)) else {
-      log(
-        "openSession.kvc",
-        "skip key=\(key) reason=no_setter deviceId=\(deviceId)"
-      )
-      return false
-    }
-    camera.setValue(value, forKey: key)
-    log(
-      "openSession.kvc",
-      "set key=\(key) value=\(value) deviceId=\(deviceId)"
-    )
-    return true
-  }
-
-  /// Read a private KVC flag if its getter selector exists, else return
-  /// "unknown" rather than crashing. Used to instrument
-  /// `isEnumeratingContent` — ICA's Phase-1 storage-walk signal — so the log
-  /// records whether the enumeration was skipped even on builds where the
-  /// property is unavailable.
-  private func readPrivateFlag(
-    _ camera: ICCameraDevice, key: String
-  ) -> String {
-    guard camera.responds(to: NSSelectorFromString(key)) else {
-      return "unknown"
-    }
-    let value = camera.value(forKey: key)
-    return "\(value ?? "nil")"
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
@@ -521,7 +497,7 @@ final class IccDeviceCoordinator: NSObject {
         : Int64((CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
       self.log(
         "catalog.progress",
-        "deviceId=\(deviceId) percent=\(pct) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
+        "deviceId=\(deviceId) percent=\(pct)",
         elapsedMs: elapsedMs
       )
       self.emitProgress(deviceId: deviceId, phase: "catalog", percent: pct)
@@ -909,7 +885,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     warmupInProgress = true
     let warmupStart = CFAbsoluteTimeGetCurrent()
     log("warmup.start",
-      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId) isEnumeratingContent=\(readPrivateFlag(camera, key: "isEnumeratingContent"))")
+      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId)")
     sendWarmupProbe(
       deviceId: deviceId, camera: camera, attempt: 1, warmupStart: warmupStart)
   }
@@ -974,14 +950,14 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       case .success(let r):
         self.log(
           "warmup.done",
-          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16)) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
+          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
           elapsedMs: elapsedMs
         )
       case .failure(let e):
         let nsErr = e as NSError
         self.log(
           "warmup.done",
-          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription) isEnumeratingContent=\(self.readPrivateFlag(camera, key: "isEnumeratingContent"))",
+          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription)",
           error: true,
           elapsedMs: elapsedMs
         )
@@ -1102,7 +1078,19 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   func cameraDevice(
     _ camera: ICCameraDevice,
     didAdd items: [ICCameraItem]
-  ) {}
+  ) {
+    // P2 (.f): now that suppression is off, log catalog delivery + timing so
+    // the real-device log shows whether catalog advances and when — the
+    // signal for "did un-suppressing collapse the first-PTP tax?"
+    let elapsedMs = pendingOpenStartedAt == 0
+      ? Int64(-1)
+      : Int64((CFAbsoluteTimeGetCurrent() - pendingOpenStartedAt) * 1000)
+    log(
+      "catalog.didAddItems",
+      "count=\(items.count) deviceId=\(activeDeviceId ?? idFor(camera))",
+      elapsedMs: elapsedMs
+    )
+  }
 
   func cameraDevice(
     _ camera: ICCameraDevice,

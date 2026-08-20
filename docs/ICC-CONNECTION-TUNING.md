@@ -214,9 +214,10 @@ Swift 常量 `IccDeviceCoordinator.iccBuildTag`，格式 `YYYY-MM-DD.N`：
 | `2026-08-20.b` | 试 KVC `basicMediaModel` / `preheatMetadata` / `ptpEventForwarding` |
 | `2026-08-20.c` | 试私有 `requestOpenSessionWithOptions:` 方法（iOS 26 已移除，fallback） |
 | `2026-08-20.d` | **撤掉 .b/.c 噪音代码**，回到干净 public-API baseline；`command.error` 显式记录 `domain`/`code`（决定性区分 `-21249` 授权门 vs 阻塞后成功）；warmup 加 `-21249` 有界重试探针（指数退避 1→8s，110s 上限，~17 次封顶以不冲爆 200 行日志环）揭示真实门开启时间 |
-| `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前用**崩溃安全**的 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`（`responds(to: set<Key>:)` 门控，无 setter 则静默跳过并记 `openSession.kvc skip`）尝试切到最小媒体模型；同时新增 `isEnumeratingContent`（ICA Phase-1 信号）遥测，在 **preOpen / catalog.progress / warmup.start / warmup.done** 四处记录 → 无论 KVC 是否生效，下一份真机日志都能一锤定音「Phase 1 到底跳没跳」 |
+| `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前崩溃安全 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`；`isEnumeratingContent` 遥测。**实测结论：`basicMediaModel` setter 在 iOS 26 存在且成功设置，但仍旧 102s → 确认是噪音；`preheatMetadata` 无 setter；`isEnumeratingContent` 整段阻塞里恒为 0（无用信号）。意外收获：日志抓到相机 USB 重枚举 —— conn#1(365B) 11ms 秒回、catalog 瞬间 100%；conn#2(531B 全量设备) 阻塞 102s、catalog 全程卡 0%。** |
+| `2026-08-20.f` | **P2：怀疑是我们自己的 catalog 抑制导致卡死**。关掉 `responds(to:)` 对 `didAddItems:` 等的抑制（`suppressMediaCatalog=false`），测试「对 catalog 回调答 NO」是否正是让 ICA 空转 ~100s 才服务首条裸 PTP 的原因。撤掉 `.e` 的 KVC 噪音；stub 回调加日志（count + elapsed）。相对 `.d` 干净 baseline 的单一决定性变量 |
 
-App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e)
+App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f)
 
 ### P0 测量：拿到日志后怎么读
 
@@ -264,6 +265,33 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 - KVC 生效但**耗时不变**（仍 ~96s）→ `basicMediaModel` 是噪音（复现 `.b` 的不稳定），彻底放弃私有 KVC，全力 H1/H3。
 
 无论哪条分支，`.e` 都把「Phase 1 有没有被跳过」从推断变成日志里的一个布尔值。
+
+#### P1 实测结论（`.e` 真机日志，2026-08-20，iPhone 17 / iOS 26.5.1 / Z 30）
+
+三条私有 API 线**全部走死**，但抓到一个更大的新线索：
+
+- ❌ `basicMediaModel=true` —— **setter 在 iOS 26 确实存在**（`openSession.kvc set key=basicMediaModel value=true`，不是 no_setter），但 conn#2 仍旧阻塞 102s → **确认是噪音**（复现 `.b` 的不稳定），废弃。
+- ❌ `preheatMetadata` —— `openSession.kvc skip ... no_setter`，iOS 26 无此键。
+- ❌ `isEnumeratingContent` —— preOpen / warmup / 整段 102s 阻塞里**恒为 0**，甚至阻塞中也是 0 → 这个私有属性在 iOS 26 上不反映 Phase-1，**无用信号**，废弃。
+- 🔑 **新线索（关键）：相机 USB 重枚举 + 两次连接天差地别。** 日志里 `device.didRemove` → `browser.didAdd`，前后两次 `GetDeviceInfo` 负载不同：
+  - **conn#1（365B）**：`warmup.done ok elapsedMs=12`，`catalog.progress percent=100`（0→100 瞬间完成）—— **我们自己的栈上第一次跑出 12ms 秒连**（同一张卡！）。
+  - **conn#2（531B，全量设备）**：`warmup.done ok elapsedMs=102082`，`catalog.progress` 全程 **0%**，阻塞释放后依然 0%。
+  - 531B 才是 Z30 完整 DeviceInfo（capture/tether op 齐全，是我们控制要用的模式）；365B 是相机初始/精简 PTP 人格的瞬态。**税绑定在「全量 PTP + 有存储」那次枚举上。**
+
+**重新定位：** 102s 阻塞对 `catalog%`（0）和 `isEnumeratingContent`（0）**双双不可见** → 它不是「内容 catalog 阶段」，而是 ICA 单纯把我们的**首条裸 `requestSendPTPCommand` 压在队列里** ~100s 不服务，内部在忙别的且不上报。这把 **H1（裸 PTP 透传被 gate）** 顶成头号嫌疑；但同时冒出一个「可能是我们自己作的」新怀疑 —— 见 P2。
+
+### P2：会不会是我们自己的 catalog 抑制在作祟（`.f`）
+
+对照 conn#1/conn#2 唯一的结构差异：conn#2 的 `catalog%` 从头到尾卡 0%，而**我们一直在用 `responds(to:)` 对 ICA 隐藏 `didAddItems:` / `didReceiveThumbnail:` / `deviceDidBecomeReadyWithCompleteContentCatalog:` 这些回调**（Phase B v1 的「骗过 ICA」hack）。
+
+**新假设：** ICA 想投递 catalog 回调，但我们对这些 selector 答 `NO` → ICA 反复尝试/等到某个内部超时（~100s）才放弃并转而服务我们的首条裸 PTP。也就是说，**当初为「跳过 Phase 2 加速」而加的抑制，可能正是把连接拖到 ~100s 的元凶**（历史数据也隐约支持：无抑制时 78s，`.d` 带抑制反而 96s）。
+
+`.f` 做**单一变量**验证：把抑制关掉（`suppressMediaCatalog=false`），让 ICA 正常投递 catalog 回调；stub 回调加 `catalog.didAddItems count=.. elapsedMs=..` 日志。撤掉 `.e` 的 KVC 噪音。
+
+**怎么读 `.f` 日志（决定性）：**
+
+- `warmup.done ok elapsedMs` 从 ~100s **骤降到几秒**，且看到 `catalog.didAddItems` 正常 fire、`catalog.progress` 从 0 往上走 → **抑制就是元凶**，直接删掉这个 hack（代价：Phase 2 会枚举缩略图，但如果连接因此秒开，完全值得）。
+- 仍旧 ~100s，只是多了 `catalog.didAddItems` 日志 → 抑制无辜，锁定 **H1**：转攻「首条裸 PTP 透传为何被 ICA gate ~100s」以及 Cascable 如何用 ICA 却不吃这个税（下一步：不在 `didOpen+0ms` 立刻发裸 PTP，改等 `deviceDidBecomeReady:` 早回调再发，测 gate 是否是「过早发裸 PTP」触发的）。
 
 ---
 
@@ -313,5 +341,7 @@ didOpenSessionWithError(nil)  ← 1ms 内触发（session 建立）
 | + Phase B v4 KVC basicMediaModel（第 3 次） | **191,201** | 比 baseline 慢 2.4 倍 |
 | Phase B v5 options API attempt | 191,201 (fallback) | iOS 26 移除了此方法 |
 | **`.d` 干净 baseline（实测）** | **96,737** | **零 -21249，attempts=1，OK 0x2001；管道争用模型确认；tx=2 仅 0.8s** |
+| **`.e` conn#1（365B 瞬态枚举）** | **12** | **同卡秒连！catalog 0→100 瞬间；basicMediaModel=true 已设** |
+| **`.e` conn#2（531B 全量设备）** | **102,082** | **重枚举后的全量人格；catalog 全程 0%；isEnumeratingContent 恒 0；basicMediaModel 无效 → 噪音** |
 | **Cascable Studio（同卡对照，已确认）** | **~5,000** | **同一张卡（95.4G 可用）冷启动;也走 ICA/PTP → 证明 app 侧存在快速路径,我们的用法有问题** |
 | **拔掉 SD 卡（对照）** | **<1,000** | Phase 1 无东西可枚举 |
