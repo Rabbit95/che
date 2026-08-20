@@ -73,7 +73,20 @@ final class IccDeviceCoordinator: NSObject {
   ///                  dump the live ICCameraDevice/ICDevice method list + type
   ///                  encodings (introspect.sel) to find the exact open selector
   ///                  to call in `.i`. No behaviour change; still ~79s. See §P4.
-  private static let iccBuildTag: String = "2026-08-20.i"
+  ///   2026-08-20.j — COPY Cascable's DEDICATED ICA THREAD. `.i` proved the ICA
+  ///                  API surface is byte-identical to Cascable (empty-dict
+  ///                  options-open, same passthrough) yet we enumerate the same
+  ///                  card ~16× slower — the gap is environmental, not in the
+  ///                  method. Cascable's ICCPTPTransport runs the whole ICA stack
+  ///                  on a private serial thread with a live CFRunLoop; we drove
+  ///                  it from Flutter's busy main runloop. This build moves the
+  ///                  ENTIRE stack — ICDeviceBrowser create/start, session
+  ///                  open/close, requestSendPTPCommand, KVO, watchdog, warmup
+  ///                  poll — onto a dedicated `IccIcaThread` (own live runloop),
+  ///                  and marshals every pigeon call (flutterApi + completions)
+  ///                  back to main. Hypothesis: an unstarved ICA runloop lets its
+  ///                  first-command USB servicing complete in Cascable-like time.
+  private static let iccBuildTag: String = "2026-08-20.j"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -117,7 +130,12 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   private let flutterApi: IccPtpFlutterApi
-  private let browser: ICDeviceBrowser
+  // `.j` — the ICA stack lives on a dedicated thread with its own live
+  // CFRunLoop (see IccIcaThread). The browser is created ON that thread in
+  // `init`, so it is an implicitly-unwrapped `var` assigned inside the
+  // synchronous `icaThread.performSync` bootstrap below rather than a `let`.
+  private let icaThread = IccIcaThread(name: "com.che.nikon_ptp_flutter.ica")
+  private var browser: ICDeviceBrowser!
   private var devicesById: [String: ICCameraDevice] = [:]
 
   /// Emit a structured log line via BOTH `os.Logger` (for macOS Console
@@ -139,9 +157,47 @@ final class IccDeviceCoordinator: NSObject {
     } else {
       Self.log.info("\(combined, privacy: .public)")
     }
-    flutterApi.onDiagnosticLog(
-      tag: tag, message: message, elapsedMs: elapsedMs
-    ) { _ in }
+    // `.j` — most log() calls now originate on the ICA thread; the Flutter
+    // binary messenger must only be touched on the platform (main) thread.
+    onMain { [flutterApi] in
+      flutterApi.onDiagnosticLog(
+        tag: tag, message: message, elapsedMs: elapsedMs
+      ) { _ in }
+    }
+  }
+
+  // MARK: - Thread marshalling helpers (`.j`)
+
+  /// Run `block` on the main (platform) thread. All `flutterApi` pigeon calls
+  /// and all pigeon completions must go through here because the ICA stack now
+  /// runs on `icaThread`, and Flutter's binary messenger is main-thread-only.
+  private func onMain(_ block: @escaping () -> Void) {
+    if Thread.isMainThread {
+      block()
+    } else {
+      DispatchQueue.main.async(execute: block)
+    }
+  }
+
+  /// Wrap a pigeon HostApi completion so it always resolves on the main thread,
+  /// no matter which thread the ICA stack fires it from.
+  private func mainReply<T>(
+    _ completion: @escaping (Result<T, Error>) -> Void
+  ) -> (Result<T, Error>) -> Void {
+    return { result in
+      DispatchQueue.main.async { completion(result) }
+    }
+  }
+
+  /// Schedule `block` on the ICA thread after `delay` seconds. The delay is
+  /// timed on a background queue (the ICA runloop has no timer of ours), then
+  /// the block is marshalled onto the ICA thread so it can touch coordinator
+  /// state and ICA safely.
+  private func icaPerform(after delay: Double, _ block: @escaping () -> Void) {
+    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+      [weak self] in
+      self?.icaThread.perform(block)
+    }
   }
 
   // Active session state — at most one camera has an open session at a time.
@@ -192,11 +248,23 @@ final class IccDeviceCoordinator: NSObject {
 
   init(flutterApi: IccPtpFlutterApi) {
     self.flutterApi = flutterApi
-    self.browser = ICDeviceBrowser()
     super.init()
 
+    // `.j` — create + configure + start the browser ON the dedicated ICA
+    // thread so ICA anchors all of its discovery/session/PTP callbacks to that
+    // thread's live runloop (not Flutter's main runloop). `performSync` blocks
+    // init until the browser is up, so `self.browser` is never observed nil.
+    icaThread.performSync { [weak self] in
+      guard let self = self else { return }
+      self.bootstrapBrowserOnIcaThread()
+    }
+  }
+
+  /// One-time browser setup, executed on the ICA thread from `init`.
+  private func bootstrapBrowserOnIcaThread() {
+    self.browser = ICDeviceBrowser()
     log("browser.init",
-      "coordinator constructed iccBuildTag=\(Self.iccBuildTag)")
+      "coordinator constructed iccBuildTag=\(Self.iccBuildTag) thread=ica")
     self.browser.delegate = self
     let mask = ICDeviceTypeMask(rawValue:
       ICDeviceTypeMask.camera.rawValue |
@@ -243,7 +311,14 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   deinit {
-    browser.stop()
+    // The coordinator is a session-lifetime singleton, so this realistically
+    // never runs. Tear the ICA stack down on its own thread (browser sources
+    // are anchored there), then stop the runloop.
+    let browserRef = browser
+    icaThread.performSync {
+      browserRef?.stop()
+    }
+    icaThread.stop()
     catalogObserver?.invalidate()
     pendingOpenWatchdog?.cancel()
   }
@@ -313,12 +388,29 @@ final class IccDeviceCoordinator: NSObject {
   // MARK: - HostApi surface (invoked from IccPtpPlugin)
 
   func snapshot() -> [IccCameraInfo] {
-    return devicesById.map { (deviceId, device) in
-      makeInfo(deviceId: deviceId, device: device)
+    // Called synchronously from the pigeon HostApi on main; `devicesById` is
+    // owned by the ICA thread, so read it there and hand the value back.
+    var result: [IccCameraInfo] = []
+    icaThread.performSync { [weak self] in
+      guard let self = self else { return }
+      result = self.devicesById.map { (deviceId, device) in
+        self.makeInfo(deviceId: deviceId, device: device)
+      }
     }
+    return result
   }
 
   func openSession(
+    deviceId: String,
+    completion: @escaping (Result<Bool, Error>) -> Void
+  ) {
+    let completion = mainReply(completion)
+    icaThread.perform { [weak self] in
+      self?.openSessionOnIca(deviceId: deviceId, completion: completion)
+    }
+  }
+
+  private func openSessionOnIca(
     deviceId: String,
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
@@ -383,6 +475,12 @@ final class IccDeviceCoordinator: NSObject {
   /// first-PTP tax has already been paid. Called by the Dart side from
   /// `IccCameraDiscovery.watch()` onListen / onCancel.
   func setEagerPreOpen(_ enabled: Bool) {
+    icaThread.perform { [weak self] in
+      self?.setEagerPreOpenOnIca(enabled)
+    }
+  }
+
+  private func setEagerPreOpenOnIca(_ enabled: Bool) {
     log("eager.setEnabled",
       "enabled=\(enabled) iccBuildTag=\(Self.iccBuildTag)")
     eagerPreOpenEnabled = enabled
@@ -553,7 +651,10 @@ final class IccDeviceCoordinator: NSObject {
       let options: [String: Any] = [:]
       let completion: @convention(block) (NSError?) -> Void = { [weak self] err in
         guard let self = self else { return }
-        DispatchQueue.main.async {
+        // ICA may fire this completion on an internal thread. Funnel it back
+        // onto our ICA thread so the delegate handling touches state under the
+        // same serial ordering as every other ICA callback.
+        self.icaThread.perform {
           self.log(
             "openSession.optionsCompletion",
             "fired deviceId=\(deviceId) err=\(err?.localizedDescription ?? "nil")"
@@ -577,6 +678,15 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   func closeSession(completion: @escaping (Result<Void, Error>) -> Void) {
+    let completion = mainReply(completion)
+    icaThread.perform { [weak self] in
+      self?.closeSessionOnIca(completion: completion)
+    }
+  }
+
+  private func closeSessionOnIca(
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
     log(
       "closeSession.request",
       "deviceId=\(activeDeviceId ?? "<none>")"
@@ -608,6 +718,21 @@ final class IccDeviceCoordinator: NSObject {
   }
 
   func sendPtpCommand(
+    opcode: Int64,
+    txId: Int64,
+    params: [Int64],
+    outData: Data?,
+    completion: @escaping (Result<PtpCommandResult, Error>) -> Void
+  ) {
+    let completion = mainReply(completion)
+    icaThread.perform { [weak self] in
+      self?.sendPtpCommandOnIca(
+        opcode: opcode, txId: txId, params: params,
+        outData: outData, completion: completion)
+    }
+  }
+
+  private func sendPtpCommandOnIca(
     opcode: Int64,
     txId: Int64,
     params: [Int64],
@@ -665,36 +790,45 @@ final class IccDeviceCoordinator: NSObject {
 
   private func schedulePendingOpenWatchdog(deviceId: String) {
     pendingOpenWatchdog?.cancel()
+    // Time the deadline on a background queue, then run the actual state
+    // mutation on the ICA thread. Cancellation via `workItem.cancel()` still
+    // wins if the deadline hasn't fired; if it has, `openWatchdogFired`
+    // re-checks the pending state under the ICA thread's serial ordering.
     let workItem = DispatchWorkItem { [weak self] in
       guard let self = self else { return }
-      guard !self.pendingOpenCompletions.isEmpty else { return }
-      let elapsedMs = Int64(
-        (CFAbsoluteTimeGetCurrent() - self.pendingOpenStartedAt) * 1000)
-      self.log(
-        "openSession.timeout",
-        "deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
-        error: true,
-        elapsedMs: elapsedMs
-      )
-      let comps = self.pendingOpenCompletions
-      self.pendingOpenCompletions = []
-      self.pendingOpenDeviceId = nil
-      self.catalogObserver?.invalidate()
-      self.catalogObserver = nil
-      self.activeDevice = nil
-      self.activeDeviceId = nil
-      self.emitProgress(deviceId: deviceId, phase: "timeout", percent: -1)
-      self.flutterApi.onSessionEnded(
-        deviceId: deviceId, reason: "timeout") { _ in }
-      let err = self.iccError(
-        code: 504,
-        message:
-          "ICA openSession timeout after \(Int(self.openSessionTimeoutSeconds))s")
-      for c in comps { c(.failure(err)) }
+      self.icaThread.perform { self.openWatchdogFired(deviceId: deviceId) }
     }
     pendingOpenWatchdog = workItem
-    DispatchQueue.main.asyncAfter(
+    DispatchQueue.global().asyncAfter(
       deadline: .now() + openSessionTimeoutSeconds, execute: workItem)
+  }
+
+  private func openWatchdogFired(deviceId: String) {
+    guard !pendingOpenCompletions.isEmpty else { return }
+    let elapsedMs = Int64(
+      (CFAbsoluteTimeGetCurrent() - pendingOpenStartedAt) * 1000)
+    log(
+      "openSession.timeout",
+      "deviceId=\(deviceId) elapsedMs=\(elapsedMs)",
+      error: true,
+      elapsedMs: elapsedMs
+    )
+    let comps = pendingOpenCompletions
+    pendingOpenCompletions = []
+    pendingOpenDeviceId = nil
+    catalogObserver?.invalidate()
+    catalogObserver = nil
+    activeDevice = nil
+    activeDeviceId = nil
+    emitProgress(deviceId: deviceId, phase: "timeout", percent: -1)
+    onMain { [flutterApi] in
+      flutterApi.onSessionEnded(deviceId: deviceId, reason: "timeout") { _ in }
+    }
+    let err = iccError(
+      code: 504,
+      message:
+        "ICA openSession timeout after \(Int(openSessionTimeoutSeconds))s")
+    for c in comps { c(.failure(err)) }
   }
 
   private func emitProgress(
@@ -707,12 +841,14 @@ final class IccDeviceCoordinator: NSObject {
     let elapsedMs = base == 0
       ? 0
       : Int64((CFAbsoluteTimeGetCurrent() - base) * 1000)
-    flutterApi.onSessionOpenProgress(
-      deviceId: deviceId,
-      phase: phase,
-      percent: percent,
-      elapsedMs: elapsedMs
-    ) { _ in }
+    onMain { [flutterApi] in
+      flutterApi.onSessionOpenProgress(
+        deviceId: deviceId,
+        phase: phase,
+        percent: percent,
+        elapsedMs: elapsedMs
+      ) { _ in }
+    }
   }
 
   // MARK: - Private helpers
@@ -883,7 +1019,7 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
     )
     devicesById[deviceId] = camera
     let info = makeInfo(deviceId: deviceId, device: camera)
-    flutterApi.onDeviceAdded(device: info) { _ in }
+    onMain { [flutterApi] in flutterApi.onDeviceAdded(device: info) { _ in } }
 
     // Eager pre-open: only when Dart-side Discovery is subscribed
     // (`setEagerPreOpen(true)`). Kicks off `requestOpenSession` +
@@ -906,7 +1042,9 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
     )
     devicesById.removeValue(forKey: deviceId)
     warmupCompletedDeviceIds.remove(deviceId)
-    flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
+    onMain { [flutterApi] in
+      flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
+    }
 
     if activeDeviceId == deviceId {
       activeDevice = nil
@@ -925,8 +1063,9 @@ extension IccDeviceCoordinator: ICDeviceBrowserDelegate {
           message: "Device \(deviceId) unplugged during openSession")
         for c in comps { c(.failure(err)) }
       }
-      flutterApi.onSessionEnded(
-        deviceId: deviceId, reason: "unplug") { _ in }
+      onMain { [flutterApi] in
+        flutterApi.onSessionEnded(deviceId: deviceId, reason: "unplug") { _ in }
+      }
     }
   }
 }
@@ -961,10 +1100,13 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
           message: "Device \(deviceId) unplugged during openSession")
         for c in comps { c(.failure(err)) }
       }
-      flutterApi.onSessionEnded(
-        deviceId: deviceId, reason: "unplug") { _ in }
+      onMain { [flutterApi] in
+        flutterApi.onSessionEnded(deviceId: deviceId, reason: "unplug") { _ in }
+      }
     }
-    flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
+    onMain { [flutterApi] in
+      flutterApi.onDeviceRemoved(deviceId: deviceId) { _ in }
+    }
   }
 
   func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
@@ -1130,7 +1272,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
             elapsedMs: elapsedMs
           )
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        self.icaPerform(after: delay) { [weak self] in
           guard let self = self else { return }
           guard self.warmupInProgress,
             self.pendingOpenDeviceId == deviceId,
@@ -1263,11 +1405,13 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       "ptpEvent",
       "code=0x\(String(code, radix: 16)) tx=\(txId)"
     )
-    flutterApi.onPtpEvent(
-      eventCode: Int64(code),
-      transactionId: Int64(txId),
-      params: params
-    ) { _ in }
+    onMain { [flutterApi] in
+      flutterApi.onPtpEvent(
+        eventCode: Int64(code),
+        transactionId: Int64(txId),
+        params: params
+      ) { _ in }
+    }
   }
 
   // --- ICCameraDeviceDelegate: other required methods (no-op stubs) ---
