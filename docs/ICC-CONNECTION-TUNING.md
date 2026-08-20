@@ -216,8 +216,9 @@ Swift 常量 `IccDeviceCoordinator.iccBuildTag`，格式 `YYYY-MM-DD.N`：
 | `2026-08-20.d` | **撤掉 .b/.c 噪音代码**，回到干净 public-API baseline；`command.error` 显式记录 `domain`/`code`（决定性区分 `-21249` 授权门 vs 阻塞后成功）；warmup 加 `-21249` 有界重试探针（指数退避 1→8s，110s 上限，~17 次封顶以不冲爆 200 行日志环）揭示真实门开启时间 |
 | `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前崩溃安全 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`；`isEnumeratingContent` 遥测。**实测结论：`basicMediaModel` setter 在 iOS 26 存在且成功设置，但仍旧 102s → 确认是噪音；`preheatMetadata` 无 setter；`isEnumeratingContent` 整段阻塞里恒为 0（无用信号）。意外收获：日志抓到相机 USB 重枚举 —— conn#1(365B) 11ms 秒回、catalog 瞬间 100%；conn#2(531B 全量设备) 阻塞 102s、catalog 全程卡 0%。** |
 | `2026-08-20.f` | **P2：怀疑是我们自己的 catalog 抑制导致卡死**。关掉 `responds(to:)` 对 `didAddItems:` 等的抑制（`suppressMediaCatalog=false`），测试「对 catalog 回调答 NO」是否正是让 ICA 空转 ~100s 才服务首条裸 PTP 的原因。撤掉 `.e` 的 KVC 噪音；stub 回调加日志（count + elapsed）。相对 `.d` 干净 baseline 的单一决定性变量 |
+| `2026-08-20.g` | **P3：逆向 Cascable 7.2.2 IPA 后，直接抄它的有线连接**。地面真相：Cascable 用**同一套 ICA**（`ICDeviceBrowser`/`ICCameraDevice`/`requestSendPTPCommand:outData:completion:`），唯二结构差异 = ①用私有 `requestOpenSessionWithOptions:`（空/极简字典）开 session；②它的 `ICCPTPTransport` 跑 `pollForDeviceReadyWithBusyCodes:` —— 一个**容忍 busy 响应码、快速轮询**的就绪探测，而不是发一条命令干等 ICA hold ~100s。故 `.g` = options-open（空字典，`.c` 的猜键是错的）+ busy-code 就绪轮询（对 `0x2019 DeviceBusy`/`0x2003 SessionNotOpen`/`0x2004 InvalidTransactionID`/`-21249` 重试，busy 用 150ms 紧轮询、`-21249` 用退避）。每次发送记 `perSendMs`（决定性：首命令是被 ICA **阻塞 100s**，还是被相机**快速返回 busy**？）。保留 `suppressMediaCatalog=false` |
 
-App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f)
+App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f) → `0.3.5+8` (.g)
 
 ### P0 测量：拿到日志后怎么读
 
@@ -292,6 +293,32 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 
 - `warmup.done ok elapsedMs` 从 ~100s **骤降到几秒**，且看到 `catalog.didAddItems` 正常 fire、`catalog.progress` 从 0 往上走 → **抑制就是元凶**，直接删掉这个 hack（代价：Phase 2 会枚举缩略图，但如果连接因此秒开，完全值得）。
 - 仍旧 ~100s，只是多了 `catalog.didAddItems` 日志 → 抑制无辜，锁定 **H1**：转攻「首条裸 PTP 透传为何被 ICA gate ~100s」以及 Cascable 如何用 ICA 却不吃这个税（下一步：不在 `didOpen+0ms` 立刻发裸 PTP，改等 `deviceDidBecomeReady:` 早回调再发，测 gate 是否是「过早发裸 PTP」触发的）。
+
+### P3：逆向 Cascable 7.2.2 IPA，直接抄它的有线连接（`.g`）
+
+拿到 Cascable Studio 7.2.2 解密 IPA 后逆向 `CascableCore.framework`（thin arm64，用 `python`（不是坏掉的 `python3` Store stub）跑字符串提取）。**地面真相推翻了之前「Cascable 不用 ICA」的错误结论** —— 那是坏解释器静默返回空、被误读成「0 命中」的产物。Cascable 的有线路径**和我们走同一套 ImageCaptureCore**：
+
+- `ICDeviceBrowser`（ivar `_wiredCameraBrowser`）→ `ICCameraDevice` → 包进 `CBLWiredCameraDevice` / `GenericWiredCamera`。
+- 传输类 `CascableCore.ICCPTPTransport`（文件 `Transport Helpers/ICCPTPTransport.swift`）。
+- **所有 PTP 都走同一个公开 `requestSendPTPCommand:outData:completion:`** —— 和我们逐字一样，没有私有 passthrough 发送路径。
+- 开 session 用**私有 `requestOpenSessionWithOptions:completion:`**，但**不引用任何 Apple 的 option-key 常量**（没有 `basicMediaModel`、没有 `ICEnumerationChronologicalOrder`…）→ options 字典是**空/极简**的，价值（若有）在不同的**内部路径**（`requestOpenSessionWithOptions:` → `loadDeviceModuleWithOptions:` → `bringupDeviceConnection`），不在字典内容。
+- 连接序列：`requestOpenSessionWithOptions:` → `device:didOpenSessionWithError:` → `executeConnectionSteps:then:` → **`pollForDeviceReadyWithBusyCodes:then:queue:`** —— 一个**容忍 busy 响应码的重试轮询**（`0x2019 DeviceBusy`、`InvalidTransactionID`、Canon `NotReady`、"Session Already Open"），直到相机答就绪。
+- Nikon 逻辑在自己的 ObjC 驱动 `CBLNikonCamera`（裸 Nikon PTP opcode + 长轮询事件循环）；**不抑制 ICA catalog 回调，也不设私有 KVC 属性**。
+
+**唯二结构差异 vs 我们的代码：** (1) 开 session 变体（`.c` 用**猜的**键试过 → 不是解药）；(2) **busy-code 就绪轮询取代一条阻塞式 warmup**（真正没抄过 → `.g` 实验）。
+
+`.g` 做法：
+1. `requestOpenSessionLikeCascable`：`responds(to:)` 门控下改调 `requestOpenSessionWithOptions:`，传**空字典 `[:]`**（不是 `.c` 的猜键）；无此私有 API 时 fallback 到 `requestOpenSession()`。
+2. `fireWarmup` 重写成 Cascable 式 busy-code 轮询：反复发 GetDeviceInfo，对 `0x2019`/`0x2003`/`0x2004`/`-21249` 判定为「可重试的 busy」→ busy 用 150ms 紧轮询、`-21249` 用退避，直到相机返回真正的 OK 或超 `warmupRetryDeadline`。
+3. **每次发送记 `perSendMs`（本次发送耗时）+ `elapsedMs`（累计）**，节流打 `warmup.poll`。
+
+**怎么读 `.g` 日志（决定性数据 = 首次发送的 `perSendMs`）：**
+
+- **首条 `warmup.poll`/`warmup.done` 的 `perSendMs` ≈ 100000（~100s）** → ICA 仍旧把首条裸 PTP **压住 ~100s** 才返回；options-open 空字典没打开旁路，busy 轮询无从触发（因为命令根本没返回给我们）。→ 锁死 H1「ICA 在服务首条裸 PTP 前先跑完内部 Phase-1」，options 变体证伪，下一步只能攻「让 ICA 别把首条命令排在 Phase-1 之后」。
+- **首条 `perSendMs` 很小（几十~几百 ms）却带 busy 响应码，之后紧轮询几次转 OK，总 `elapsedMs` << 100s** → options-open 让命令**透传到相机**、相机快速回 busy、我们的 busy 轮询把它接住 → **Cascable 式连接抄成功**，删掉旧的单发阻塞 warmup。
+- 首条 `perSendMs` 小、直接 OK、无 busy → 更好，options-open 本身就绕开了 Phase-1。
+
+无论哪条分支，`.g` 的 `perSendMs` 都把「首命令是被 ICA 阻塞 vs 被相机快速拒绝」这个此前靠间接推断的问题，变成日志里一个直接可读的数。
 
 ---
 

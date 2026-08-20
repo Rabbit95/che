@@ -45,7 +45,21 @@ final class IccDeviceCoordinator: NSObject {
   ///                  (suppressMediaCatalog=false) to test if answering NO to
   ///                  didAddItems: is what makes ICA busy-wait ~100s before the
   ///                  first raw PTP. Reverts .e KVC noise; logs catalog delivery.
-  private static let iccBuildTag: String = "2026-08-20.f"
+  ///   2026-08-20.g — COPY Cascable 7.2.2's wired connect (reverse-engineered
+  ///                  from its IPA). Ground truth: Cascable uses the SAME ICA
+  ///                  stack (ICDeviceBrowser/ICCameraDevice/requestSendPTPCommand)
+  ///                  — the only structural deltas are (1) it opens via
+  ///                  `requestOpenSessionWithOptions:` (private) with an
+  ///                  empty/minimal dict, and (2) its ICCPTPTransport runs
+  ///                  `pollForDeviceReadyWithBusyCodes:` — a readiness poll that
+  ///                  TOLERATES busy PTP response codes and retries fast, rather
+  ///                  than issuing one command and eating ICA's ~100s hold. So
+  ///                  `.g` = options-open (empty dict, `.c`'s guessed keys were
+  ///                  the mistake) + busy-code readiness polling. Each send now
+  ///                  logs its OWN elapsed (decisive: does the first command get
+  ///                  BLOCKED ~100s by ICA, or returned busy fast by the camera?).
+  ///                  Keeps suppressMediaCatalog=false. See docs §P3.
+  private static let iccBuildTag: String = "2026-08-20.g"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -64,6 +78,28 @@ final class IccDeviceCoordinator: NSObject {
   private static func warmupRetryDelay(forAttempt attempt: Int) -> Double {
     let exp = pow(2.0, Double(max(0, attempt - 1)))
     return min(warmupRetryMaxDelaySeconds, warmupRetryBaseDelaySeconds * exp)
+  }
+
+  // `.g` — Cascable-style readiness polling. Cascable's ICCPTPTransport uses
+  // `pollForDeviceReadyWithBusyCodes:` — it sends a probe and treats these PTP
+  // response codes as "camera still coming up, retry" rather than terminal.
+  // If ICA passes our first command THROUGH (instead of holding it ~100s), the
+  // camera answers one of these fast and we poll on a TIGHT interval until OK.
+  // PTP standard: 0x2019 Device_Busy, 0x2003 Session_Not_Open,
+  // 0x2004 Invalid_TransactionID. Plus ICA's own -21249 auth-not-ready gate.
+  private static let ptpDeviceBusyCode: Int = 0x2019
+  private static let ptpSessionNotOpenCode: Int = 0x2003
+  private static let ptpInvalidTransactionCode: Int = 0x2004
+  // Fast poll while the camera reports busy — Cascable retries in tight loops,
+  // not with second-scale backoff. 150 ms keeps the log readable over ~110 s.
+  private static let readyPollIntervalSeconds: Double = 0.15
+
+  /// Is this PTP response code a "not ready yet, poll again" signal (as opposed
+  /// to a terminal error)? Mirrors Cascable's busy-code set.
+  private static func isBusyResponseCode(_ code: Int) -> Bool {
+    return code == ptpDeviceBusyCode
+      || code == ptpSessionNotOpenCode
+      || code == ptpInvalidTransactionCode
   }
 
   private let flutterApi: IccPtpFlutterApi
@@ -413,7 +449,37 @@ final class IccDeviceCoordinator: NSObject {
     emitProgress(deviceId: deviceId, phase: "openSession", percent: -1)
     schedulePendingOpenWatchdog(deviceId: deviceId)
 
-    log("openSession.requestOpenSession", "issued deviceId=\(deviceId)")
+    // `.g` — open the way Cascable does: the PRIVATE
+    // `requestOpenSessionWithOptions:` variant. `.c` tried this with GUESSED
+    // tuning keys (basicMediaModel etc.) and it didn't help — but the RE of
+    // Cascable shows it passes NO Apple option keys at all, so the value (if
+    // any) is the different INTERNAL open path (loadDeviceModuleWithOptions: →
+    // bringupDeviceConnection), not the dict. We pass an EMPTY dict to match.
+    // Falls back to the public no-arg API if the selector is ever absent.
+    requestOpenSessionLikeCascable(on: camera, deviceId: deviceId)
+  }
+
+  /// Open the ICA session via the private `requestOpenSessionWithOptions:`
+  /// selector with an empty options dict — matching Cascable 7.2.2's wired
+  /// path. Fallback: public `requestOpenSession()`.
+  private func requestOpenSessionLikeCascable(
+    on camera: ICCameraDevice, deviceId: String
+  ) {
+    let cam = camera as NSObject
+    let optionsSel = NSSelectorFromString("requestOpenSessionWithOptions:")
+    if cam.responds(to: optionsSel) {
+      let options: [String: Any] = [:]
+      log(
+        "openSession.requestOpenSessionWithOptions",
+        "issued deviceId=\(deviceId) options=<empty> (Cascable-style)"
+      )
+      cam.perform(optionsSel, with: options)
+      return
+    }
+    log(
+      "openSession.requestOpenSession",
+      "issued deviceId=\(deviceId) (options API unavailable, fallback)"
+    )
     camera.requestOpenSession()
   }
 
@@ -876,28 +942,44 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   /// Phase P0 (2026-08-20.d): if the command is REJECTED with
   /// `-21249` (ICReturnPTPNotAuthorizedToSendCommand) rather than
   /// blocked-then-completed, ICA is gating on its internal storage
-  /// enumeration. We retry with backoff up to `warmupRetryDeadlineSeconds`
-  /// so the log reveals the TRUE gate-open time, and so the session may
-  /// clear far sooner than the worst-case cold-start tax if the gate
-  /// happens to open early.
+  /// enumeration.
+  ///
+  /// Phase P3 (2026-08-20.g): copy Cascable's `pollForDeviceReadyWithBusyCodes:`.
+  /// We retry not just on `-21249` but on any BUSY PTP response code
+  /// (DeviceBusy/SessionNotOpen/InvalidTransactionID) on a TIGHT interval,
+  /// treating them as "camera still coming up". The decisive new telemetry is
+  /// `perSendMs` on every attempt: if the FIRST send returns fast with a busy
+  /// code, ICA is passing our command through and Cascable's poll wins; if it
+  /// BLOCKS ~100s then returns OK, ICA is still holding it and options-open
+  /// didn't change that.
   private func fireWarmup(deviceId: String, camera: ICCameraDevice) {
     guard !warmupInProgress else { return }
     warmupInProgress = true
     let warmupStart = CFAbsoluteTimeGetCurrent()
     log("warmup.start",
-      "sending GetDeviceInfo (tx=1) to pay ICA first-PTP tax deviceId=\(deviceId)")
+      "polling GetDeviceInfo for device-ready (Cascable-style busy-code poll) deviceId=\(deviceId)")
     sendWarmupProbe(
       deviceId: deviceId, camera: camera, attempt: 1, warmupStart: warmupStart)
   }
 
-  /// One warmup GetDeviceInfo attempt. Recurses (with backoff) on `-21249`
-  /// until the gate opens or `warmupRetryDeadlineSeconds` elapses.
+  /// Whether to emit a log line for this poll attempt. A tight busy-poll can
+  /// fire hundreds of times over the deadline; throttle so early trace lines
+  /// survive the Dart-side 200-line ring buffer while still showing progress.
+  private static func shouldLogPollAttempt(_ attempt: Int) -> Bool {
+    return attempt <= 6 || attempt % 12 == 0
+  }
+
+  /// One readiness probe. Retries (tight interval on busy codes, capped backoff
+  /// on `-21249`) until the camera answers OK or `warmupRetryDeadlineSeconds`
+  /// elapses. Logs each attempt's OWN send latency (`perSendMs`) plus the
+  /// cumulative elapsed.
   private func sendWarmupProbe(
     deviceId: String,
     camera: ICCameraDevice,
     attempt: Int,
     warmupStart: CFAbsoluteTime
   ) {
+    let sendStart = CFAbsoluteTimeGetCurrent()
     sendRawPTP(
       camera: camera,
       opcode: 0x1001, // GetDeviceInfo
@@ -906,30 +988,44 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       outData: nil
     ) { [weak self] result in
       guard let self = self else { return }
-      let elapsedMs = Int64(
-        (CFAbsoluteTimeGetCurrent() - warmupStart) * 1000)
+      let now = CFAbsoluteTimeGetCurrent()
+      let elapsedMs = Int64((now - warmupStart) * 1000)
+      let perSendMs = Int64((now - sendStart) * 1000)
 
-      // Retry ONLY on the auth-gate rejection, and only while camera is still
-      // attached, still the active pending device, and under the deadline.
-      if case .failure(let e) = result,
-        (e as NSError).code == Self.ptpNotAuthorizedCode,
+      // Classify the outcome. `retryCode` is non-nil when this is a
+      // "not ready yet, poll again" signal (busy PTP code or ICA auth gate).
+      var retryCode: Int? = nil
+      if case .failure(let e) = result {
+        let code = (e as NSError).code
+        if code == Self.ptpNotAuthorizedCode || Self.isBusyResponseCode(code) {
+          retryCode = code
+        }
+      } else if case .success(let r) = result,
+        Self.isBusyResponseCode(Int(r.responseCode)) {
+        // Some transports surface a busy code as a "successful" send whose
+        // PTP response is non-OK — treat that as retryable too.
+        retryCode = Int(r.responseCode)
+      }
+
+      if let code = retryCode,
         camera.hasOpenSession,
         self.pendingOpenDeviceId == deviceId,
         Double(elapsedMs) / 1000.0 < Self.warmupRetryDeadlineSeconds
       {
-        let delay = Self.warmupRetryDelay(forAttempt: attempt)
-        self.log(
-          "warmup.retry",
-          "deviceId=\(deviceId) attempt=\(attempt) elapsedMs=\(elapsedMs) code=-21249 retrying in \(delay)s",
-          elapsedMs: elapsedMs
-        )
-        DispatchQueue.main.asyncAfter(
-          deadline: .now() + delay
-        ) { [weak self] in
+        // Tight poll for busy codes (Cascable-style); capped backoff only for
+        // the -21249 auth gate to avoid hammering a hard rejection.
+        let delay = code == Self.ptpNotAuthorizedCode
+          ? Self.warmupRetryDelay(forAttempt: attempt)
+          : Self.readyPollIntervalSeconds
+        if Self.shouldLogPollAttempt(attempt) {
+          self.log(
+            "warmup.poll",
+            "deviceId=\(deviceId) attempt=\(attempt) perSendMs=\(perSendMs) elapsedMs=\(elapsedMs) code=0x\(String(code, radix: 16)) retryIn=\(delay)s",
+            elapsedMs: elapsedMs
+          )
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
           guard let self = self else { return }
-          // Bail out if the open was resolved/torn down while we waited
-          // (e.g. unplug). Clear the in-progress flag so a later reconnect
-          // can warm up again — otherwise it leaks `true` forever.
           guard self.warmupInProgress,
             self.pendingOpenDeviceId == deviceId,
             camera.hasOpenSession
@@ -944,20 +1040,20 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
         return
       }
 
-      // Terminal: success, non-auth failure, or deadline reached.
+      // Terminal: OK, non-retryable failure, or deadline reached.
       self.warmupInProgress = false
       switch result {
       case .success(let r):
         self.log(
           "warmup.done",
-          "ok attempts=\(attempt) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
+          "ok attempts=\(attempt) perSendMs=\(perSendMs) elapsedMs=\(elapsedMs) respCode=0x\(String(r.responseCode, radix: 16))",
           elapsedMs: elapsedMs
         )
       case .failure(let e):
         let nsErr = e as NSError
         self.log(
           "warmup.done",
-          "err attempts=\(attempt) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription)",
+          "err attempts=\(attempt) perSendMs=\(perSendMs) elapsedMs=\(elapsedMs) domain=\(nsErr.domain) code=\(nsErr.code) err=\(e.localizedDescription)",
           error: true,
           elapsedMs: elapsedMs
         )
