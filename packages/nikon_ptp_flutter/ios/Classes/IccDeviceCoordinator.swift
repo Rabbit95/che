@@ -383,9 +383,10 @@ final class IccDeviceCoordinator: NSObject {
         "ICCameraDevicePreheatMetadata": false,
         "ptpEventForwarding": true,
       ]
+      let keysCsv = options.keys.sorted().joined(separator: ",")
       log(
         "openSession.requestOpenSessionWithOptions",
-        "issued deviceId=\(deviceId) options=\(options.keys.sorted().joined(separator: \",\"))"
+        "issued deviceId=\(deviceId) options=\(keysCsv)"
       )
       cam.perform(optionsSel, with: options)
       return
