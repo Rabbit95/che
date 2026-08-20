@@ -1,7 +1,7 @@
 name: nikon_z_control
 description: Nikon Z-series mobile control app (Wi-Fi + USB).
 publish_to: none
-version: 0.3.5+8
+version: 0.3.6+9
 
 environment:
   sdk: ^3.6.0

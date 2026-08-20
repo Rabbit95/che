@@ -2,6 +2,7 @@ import CoreGraphics
 import Flutter
 import Foundation
 import ImageCaptureCore
+import ObjectiveC
 import os
 
 /// Owns the `ICDeviceBrowser` and the currently-active `ICCameraDevice`
@@ -59,7 +60,20 @@ final class IccDeviceCoordinator: NSObject {
   ///                  logs its OWN elapsed (decisive: does the first command get
   ///                  BLOCKED ~100s by ICA, or returned busy fast by the camera?).
   ///                  Keeps suppressMediaCatalog=false. See docs §P3.
-  private static let iccBuildTag: String = "2026-08-20.g"
+  ///                  RESULT: perSendMs=78855 (first raw PTP BLOCKED ~79s then
+  ///                  returned OK 0x2001, ZERO busy codes → busy-poll is moot);
+  ///                  one-arg options selector ABSENT (fell back, like .c) →
+  ///                  options-open NEVER actually tested; suppression exonerated
+  ///                  (catalog.didAddItems fired, still 79s).
+  ///   2026-08-20.h — P4: runtime reconnaissance. `.g` showed the one-arg
+  ///                  `requestOpenSessionWithOptions:` doesn't exist on iOS 26.5.1
+  ///                  and Cascable's real API is the TWO-arg
+  ///                  `requestOpenSessionWithOptions:completion:`. Before calling
+  ///                  an unknown private method blind (block-signature crash risk),
+  ///                  dump the live ICCameraDevice/ICDevice method list + type
+  ///                  encodings (introspect.sel) to find the exact open selector
+  ///                  to call in `.i`. No behaviour change; still ~79s. See §P4.
+  private static let iccBuildTag: String = "2026-08-20.h"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -456,12 +470,64 @@ final class IccDeviceCoordinator: NSObject {
     // any) is the different INTERNAL open path (loadDeviceModuleWithOptions: →
     // bringupDeviceConnection), not the dict. We pass an EMPTY dict to match.
     // Falls back to the public no-arg API if the selector is ever absent.
+    dumpPrivateSelectors(for: camera)
     requestOpenSessionLikeCascable(on: camera, deviceId: deviceId)
+  }
+
+  // P4 (2026-08-20.h) — has the private open API been dumped yet? One-shot.
+  private static var didDumpPrivateSelectors = false
+
+  /// One-shot runtime reconnaissance (Phase P4, `.h`).
+  ///
+  /// `.g` proved our `requestOpenSessionWithOptions:` (ONE-arg) selector does
+  /// NOT exist on iOS 26.5.1 — `responds(to:)` was false so we silently fell
+  /// back to the public `requestOpenSession()`. Checking git, `.c` used the
+  /// SAME one-arg selector, so NEITHER `.c` NOR `.g` ever actually exercised
+  /// Cascable's options-open. Cascable's real selector (from the IPA RE) is the
+  /// TWO-arg `requestOpenSessionWithOptions:completion:`. Rather than call an
+  /// unknown private method blind and risk a block-signature crash (which could
+  /// also lose the diagnostic log), dump the ACTUAL ObjC method list of the live
+  /// `ICCameraDevice` and its superclasses so the next build can call the RIGHT
+  /// selector with the RIGHT signature. Zero behaviour change: this build still
+  /// opens via the public API and pays the ~79 s tax.
+  private func dumpPrivateSelectors(for camera: ICCameraDevice) {
+    guard !Self.didDumpPrivateSelectors else { return }
+    Self.didDumpPrivateSelectors = true
+    // Narrow keywords: the open/options/bringup surface only, so we don't
+    // flood the Dart-side 200-line log ring with generic session/capture noise.
+    let keywords = ["opensession", "option", "bringup", "module", "tether"]
+    var cls: AnyClass? = object_getClass(camera)
+    var dumped = 0
+    while let current = cls, current != NSObject.self {
+      let className = String(cString: class_getName(current))
+      var count: UInt32 = 0
+      guard let methods = class_copyMethodList(current, &count) else {
+        cls = class_getSuperclass(current)
+        continue
+      }
+      for i in 0..<Int(count) {
+        let sel = method_getName(methods[i])
+        let selName = NSStringFromSelector(sel)
+        let lower = selName.lowercased()
+        guard keywords.contains(where: { lower.contains($0) }) else { continue }
+        let enc = method_getTypeEncoding(methods[i])
+          .map { String(cString: $0) } ?? "?"
+        log("introspect.sel", "class=\(className) sel=\(selName) enc=\(enc)")
+        dumped += 1
+      }
+      free(methods)
+      cls = class_getSuperclass(current)
+    }
+    log("introspect.done", "matched=\(dumped) keywords=\(keywords.joined(separator: ","))")
   }
 
   /// Open the ICA session via the private `requestOpenSessionWithOptions:`
   /// selector with an empty options dict — matching Cascable 7.2.2's wired
   /// path. Fallback: public `requestOpenSession()`.
+  ///
+  /// `.h` note: the one-arg selector below is absent on iOS 26.5.1 (`.g` log),
+  /// so this always falls back today. `dumpPrivateSelectors` runs first to find
+  /// the correct two-arg `requestOpenSessionWithOptions:completion:` for `.i`.
   private func requestOpenSessionLikeCascable(
     on camera: ICCameraDevice, deviceId: String
   ) {

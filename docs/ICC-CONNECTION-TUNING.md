@@ -216,9 +216,10 @@ Swift 常量 `IccDeviceCoordinator.iccBuildTag`，格式 `YYYY-MM-DD.N`：
 | `2026-08-20.d` | **撤掉 .b/.c 噪音代码**，回到干净 public-API baseline；`command.error` 显式记录 `domain`/`code`（决定性区分 `-21249` 授权门 vs 阻塞后成功）；warmup 加 `-21249` 有界重试探针（指数退避 1→8s，110s 上限，~17 次封顶以不冲爆 200 行日志环）揭示真实门开启时间 |
 | `2026-08-20.e` | **P1 control-only 探针**（私有 API 已授权，不上架）：开 session 前崩溃安全 KVC 设 `basicMediaModel=true` + `preheatMetadata=false`；`isEnumeratingContent` 遥测。**实测结论：`basicMediaModel` setter 在 iOS 26 存在且成功设置，但仍旧 102s → 确认是噪音；`preheatMetadata` 无 setter；`isEnumeratingContent` 整段阻塞里恒为 0（无用信号）。意外收获：日志抓到相机 USB 重枚举 —— conn#1(365B) 11ms 秒回、catalog 瞬间 100%；conn#2(531B 全量设备) 阻塞 102s、catalog 全程卡 0%。** |
 | `2026-08-20.f` | **P2：怀疑是我们自己的 catalog 抑制导致卡死**。关掉 `responds(to:)` 对 `didAddItems:` 等的抑制（`suppressMediaCatalog=false`），测试「对 catalog 回调答 NO」是否正是让 ICA 空转 ~100s 才服务首条裸 PTP 的原因。撤掉 `.e` 的 KVC 噪音；stub 回调加日志（count + elapsed）。相对 `.d` 干净 baseline 的单一决定性变量 |
-| `2026-08-20.g` | **P3：逆向 Cascable 7.2.2 IPA 后，直接抄它的有线连接**。地面真相：Cascable 用**同一套 ICA**（`ICDeviceBrowser`/`ICCameraDevice`/`requestSendPTPCommand:outData:completion:`），唯二结构差异 = ①用私有 `requestOpenSessionWithOptions:`（空/极简字典）开 session；②它的 `ICCPTPTransport` 跑 `pollForDeviceReadyWithBusyCodes:` —— 一个**容忍 busy 响应码、快速轮询**的就绪探测，而不是发一条命令干等 ICA hold ~100s。故 `.g` = options-open（空字典，`.c` 的猜键是错的）+ busy-code 就绪轮询（对 `0x2019 DeviceBusy`/`0x2003 SessionNotOpen`/`0x2004 InvalidTransactionID`/`-21249` 重试，busy 用 150ms 紧轮询、`-21249` 用退避）。每次发送记 `perSendMs`（决定性：首命令是被 ICA **阻塞 100s**，还是被相机**快速返回 busy**？）。保留 `suppressMediaCatalog=false` |
+| `2026-08-20.g` | **P3：逆向 Cascable 7.2.2 IPA 后，直接抄它的有线连接**。地面真相：Cascable 用**同一套 ICA**（`ICDeviceBrowser`/`ICCameraDevice`/`requestSendPTPCommand:outData:completion:`），唯二结构差异 = ①用私有 `requestOpenSessionWithOptions:`（空/极简字典）开 session；②它的 `ICCPTPTransport` 跑 `pollForDeviceReadyWithBusyCodes:` —— 一个**容忍 busy 响应码、快速轮询**的就绪探测，而不是发一条命令干等 ICA hold ~100s。故 `.g` = options-open（空字典，`.c` 的猜键是错的）+ busy-code 就绪轮询（对 `0x2019 DeviceBusy`/`0x2003 SessionNotOpen`/`0x2004 InvalidTransactionID`/`-21249` 重试，busy 用 150ms 紧轮询、`-21249` 用退避）。每次发送记 `perSendMs`（决定性：首命令是被 ICA **阻塞 100s**，还是被相机**快速返回 busy**？）。保留 `suppressMediaCatalog=false`。**实测：`perSendMs=78855`，首条裸 PTP 被 ICA 阻塞 79s 后直接返回 OK、零 busy 码 → busy-poll 空转；单参 options 选择器不存在（回退，同 `.c`）→ options-open 从未真正跑过；抑制被洗清** |
+| `2026-08-20.h` | **P4：运行时侦察**。`.g` 证明单参 `requestOpenSessionWithOptions:` 在 iOS 26.5.1 不存在（`.c`/`.g` 都静默回退），而 Cascable 真实 API 是**两参** `requestOpenSessionWithOptions:completion:`。盲调签名未知的私有方法有 block 签名崩溃风险（且可能连日志一起丢），故先做**零风险侦察**：运行时 dump 活体 `ICCameraDevice`/`ICDevice` 方法列表 + 类型编码（`introspect.sel`），拿到确切的开 session 私有选择器供 `.i` 调用。行为不变，仍 ~79s |
 
-App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f) → `0.3.5+8` (.g)
+App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.1+4` (.c) → `0.3.2+5` (.d) → `0.3.3+6` (.e) → `0.3.4+7` (.f) → `0.3.5+8` (.g) → `0.3.6+9` (.h)
 
 ### P0 测量：拿到日志后怎么读
 
@@ -319,6 +320,36 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 - 首条 `perSendMs` 小、直接 OK、无 busy → 更好，options-open 本身就绕开了 Phase-1。
 
 无论哪条分支，`.g` 的 `perSendMs` 都把「首命令是被 ICA 阻塞 vs 被相机快速拒绝」这个此前靠间接推断的问题，变成日志里一个直接可读的数。
+
+#### P3 实测结论（`.g` 真机日志，2026-08-20，iPhone 17 / iOS 26.5.1 / Z 30）
+
+```
+openSession.requestOpenSession · issued ... (options API unavailable, fallback)
+warmup.done · ok attempts=1 perSendMs=78855 elapsedMs=78855 respCode=0x2001
+```
+
+三个硬结论：
+
+1. **`perSendMs=78855`（~79s），`attempts=1`，零 busy 码** → ICA 把首条裸 PTP **压住 79s 后直接返回 OK 0x2001**，根本没返回 busy。**busy-code 轮询是空转** —— 没有 busy 可轮。Cascable 的 busy 容忍机制单独不是解药。
+2. **`options API unavailable, fallback`** → 单参 `requestOpenSessionWithOptions:` 在 iOS 26.5.1 **不存在**，回退到普通开法。核对 git：**`.c` 用的也是单参选择器、也一样回退** → **`.c` 和 `.g` 从未真正跑过 options 开法**。Cascable 的真实 API 是**两参** `requestOpenSessionWithOptions:completion:`，此前把参数个数搞错了。
+3. **抑制被洗清（H4 证伪）**：`.g` 关了抑制（`suppressMediaCatalog=false`），日志里 `catalog.didAddItems count=1` 正常 fire，但**仍旧 79s** → 「是我们自己抑制 catalog 导致卡死」不成立。79s 是 ICA 服务首条裸 PTP 的固有税。
+
+逆向得出的两个结构性差异，现在一个空转（busy-poll）、一个**参数写错从未测过**（options-open）。真正的杠杆 `requestOpenSessionWithOptions:completion:` 一次都没试过 → 见 §P4。
+
+### P4：运行时侦察，拿到 iOS 26 上真实可调的私有开法（`.h`）
+
+盲调一个签名未知的私有 `...completion:` 方法有风险：block 参数个数/类型猜错就崩，甚至可能连诊断日志一起丢。`method_getTypeEncoding` 能确认「第 2 个参数是不是 block」，但**看不到 block 内部的参数签名**（所有 block 在方法编码里都是 `@?`）。所以 `.h` 不赌，先做**零风险侦察**：
+
+- `dumpPrivateSelectors(for:)`：运行时沿 `ICCameraDevice` → `ICDevice` → … 的类继承链走 `class_copyMethodList`，把选择器名里含 `opensession`/`option`/`bringup`/`module`/`tether` 的方法连同 `method_getTypeEncoding` 一起打成 `introspect.sel class=.. sel=.. enc=..`。一次性（静态 `didDumpPrivateSelectors` 门控），关键词收窄以免刷爆 Dart 侧 200 行日志环。
+- 本版**行为不变**：仍走公开 `requestOpenSession()`、仍付 ~79s 税。价值全在 `introspect.sel` 那几行。
+
+**怎么读 `.h` 日志：**
+
+- 找 `introspect.sel ... sel=requestOpenSessionWithOptions:completion:` → 确认这个两参 API 在 iOS 26.5.1 **确实存在**，`.i` 就用它（空字典 + `(NSError?) -> Void` completion）。
+- 若只看到别的开法变体（如某个 `...bringup...` / `loadDeviceModuleWithOptions:` / ICA 原生 tether），那就是我们没想到的私有面 → 择优在 `.i` 里试。
+- 若整条继承链**一个 options/bringup 开法都没有** → iOS 26 的 `ICCameraDevice` 根本不暴露 Cascable 那套 API（Cascable 可能链接了不同/更老的 ICA，或用了 ICImageCapture 之外的私有栈）→ 转向别的思路（如推迟首条裸 PTP、等 `deviceDidBecomeReady:` 早回调再发）。
+
+`.h` 把「iOS 26 上到底有哪些私有开 session 入口」从猜测变成日志里一份确定的清单。
 
 ---
 
