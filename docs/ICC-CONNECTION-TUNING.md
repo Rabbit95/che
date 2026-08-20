@@ -235,11 +235,19 @@ App 版本：`0.1.0+1` → `0.2.0+2` (2026-08-20.a) → `0.3.0+3` (.b) → `0.3.
 - `catalog.progress` 在整个 94s 阻塞窗口里一直 **0%**，阻塞释放后 ~200ms 内才跳到 20% —— 即 94s 花在 catalog **之前**的 Phase 1（GetStorageIDs/GetObjectHandles 内部枚举），它 gate 住 app 的首个 PTP 命令。
 - 总连接 ~95s，其中「首命令之后的一切」合计 ~1s。
 
-**推论（重要且不乐观）：** 走 USB / ICA 时，满卡 Z 30 的首命令阻塞 ~90s 无法用 app 侧任何手段消除 —— 所有 PTP 命令（含开启控制的 ChangeApplicationMode）都排在完整 catalog 之后，这 94s 内相机不接受任何控制命令。warmup 探针不省时间，只是给这笔税贴了标签。真正的解法只有两条：**(a) 减少卡上文件（Phase 1 无东西可枚举 → 秒开，已被「拔卡 <1s」佐证）**，或 **(b) 换传输层（Wi-Fi PTP-IP 绕开 ICA，P3）**。
+**修正（用户澄清后，2026-08-20）：** 全程只有一台 Z 30、一张卡；卡不是「满卡」，是 115G 中 95.4G 可用（约 17% 占用）。且 **Cascable Studio 在同一张卡、同样文件下冷启动 ~5s 连上**。这两点推翻了下面这个曾经的推论：
 
-**Cascable 对照存疑：** 研究表明 Cascable 的 USB 连接**也走 ImageCaptureCore/PTP**（见 https://cascable.se/help/wired-cameras/ ），因此附录 B 里「~5s + Apple 私下支持」的说法**不可靠**，很可能是小卡/空卡或 Wi-Fi 下的测量。待验证实验：用 Cascable Studio 连**同一张满卡** Z 30 冷启动计时 —— 若也 ~90s，则我们与 Cascable 在满卡 USB 下本就同速。
+> ~~走 USB/ICA 时首命令阻塞 ~90s 无法用 app 侧任何手段消除，只能靠缩文件或换 Wi-Fi。~~
 
-**下一步（零代码，需真机配合）：** ① 换一张近空卡冷启动连接计时（预期秒开，确认文件数因果）；② Cascable 连同一张满卡计时（消歧 Cascable 是否有我们没找到的招）。这两个数据点决定 P2（缩文件树）vs P3（Wi-Fi）的主攻方向。
+同卡同内容 Cascable 5s、我们 96.7s，差 ~19x → **存在一条 app 侧快速路径，是我们的 ICA 用法触发了 Phase-1 阻塞，而不是卡本身。** warmup 探针不省时间，但「~90s 不可避免」的说法是错的。
+
+**新主攻方向：查明 Cascable 在同一张卡上如何绕开 Phase-1 阻塞。** 已确认 Cascable 有线连接也走 ImageCaptureCore/PTP（https://cascable.se/help/wired-cameras/ ），差异在**用法**不在框架。重点假设：
+
+- **H1（最可疑）：** 我们用 `requestSendPTPCommand`（裸 PTP 透传）做 warmup，可能正是触发器 —— Apple 把裸 PTP 透传 gate 在完整 content catalog 之后。Cascable 或改用 ICA 原生 capture/tether 路径，或把透传推迟到 catalog 就绪后，从而首屏不阻塞。
+- **H2：** 存在「仅控制 / 不枚举内容」的 session 打开方式（capture-only），我们没用上。
+- **H3：** 真正的 gate 不是「catalog 完成」，而是别的可提前满足的条件。
+
+**下一步：** ① 研究 spike：ICA 能否「开 session 做控制但不等 content catalog」+ Cascable 具体做法；② 零代码真机复核：**拔掉 SD 卡**以无卡态跑 `.d` 版连接计时（预期 <1s，与历史「拔卡 <1s」对齐，确认自身下限 —— 但这已知，优先级低于 ①）。
 
 ---
 
@@ -274,7 +282,7 @@ didOpenSessionWithError(nil)  ← 1ms 内触发（session 建立）
 
 ## 附录 B：数据一览
 
-真机实测数据（iPhone 17, iOS 26.5.1, Nikon Z 30, 满 SD 卡）：
+真机实测数据（iPhone 17, iOS 26.5.1, Nikon Z 30, 同一张 115G 卡 / 95.4G 可用，约 17% 占用）：
 
 | 场景 | warmup elapsedMs | 备注 |
 |---|---|---|
@@ -289,5 +297,5 @@ didOpenSessionWithError(nil)  ← 1ms 内触发（session 建立）
 | + Phase B v4 KVC basicMediaModel（第 3 次） | **191,201** | 比 baseline 慢 2.4 倍 |
 | Phase B v5 options API attempt | 191,201 (fallback) | iOS 26 移除了此方法 |
 | **`.d` 干净 baseline（实测）** | **96,737** | **零 -21249，attempts=1，OK 0x2001；管道争用模型确认；tx=2 仅 0.8s** |
-| **Cascable Studio（对照，存疑）** | ~5,000？ | Cascable USB 也走 ICA/PTP；此数很可能是小卡/Wi-Fi，待同满卡 A/B 复核 |
+| **Cascable Studio（同卡对照，已确认）** | **~5,000** | **同一张卡（95.4G 可用）冷启动;也走 ICA/PTP → 证明 app 侧存在快速路径,我们的用法有问题** |
 | **拔掉 SD 卡（对照）** | **<1,000** | Phase 1 无东西可枚举 |
