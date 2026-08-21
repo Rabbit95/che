@@ -98,7 +98,20 @@ final class IccDeviceCoordinator: NSObject {
   ///                  immediately on didOpen. Rich caps telemetry + 8s fallback so
   ///                  worst case == pre-.k. Tests: does ICA advertise PTP-ready
   ///                  EARLY (→ first command lands fast) or only after the ~80s?
-  private static let iccBuildTag: String = "2026-08-21.k"
+  ///                  RESULT: FALSIFIED — canAcceptPTP=true @19ms (cold) / @3ms
+  ///                  (reconnect) yet first raw PTP still blocked 49918ms / 35674ms.
+  ///                  The gate never waited; that capability is not the signal.
+  ///   2026-08-21.l — NATIVE-TETHER-FIRST warmup. `.k` ruled out the capability
+  ///                  gate, so instead of firing our own raw PTP first (which
+  ///                  forces ICA's slow generic bring-up), issue ICA's OWN
+  ///                  `requestEnableTethering` (the Z30 advertises it), poll the
+  ///                  native `tetheredCaptureEnabled` BOOL until true, and only
+  ///                  THEN fire the raw warmup. Decomposes the tax: tether.enable→
+  ///                  tether.ready measures native Nikon bring-up; the following
+  ///                  warmup.done perSendMs measures the raw send AFTER tethering
+  ///                  is ready. If native bring-up is fast → found the fast path;
+  ///                  if it also costs ~40s → the tax is intrinsic, just relocated.
+  private static let iccBuildTag: String = "2026-08-21.l"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -254,24 +267,21 @@ final class IccDeviceCoordinator: NSObject {
   private var warmupCompletedDeviceIds: Set<String> = []
   private var warmupInProgress: Bool = false
 
-  // `.k` — capability-gated warmup. RE of a SECOND fast-connecting app
-  // (影控台 Lite / ZControlLite 1.4.2) found it references the ICA capability
-  // constant `ICCameraDeviceCanAcceptPTPCommands` and carries NO driverkit
-  // entitlement — falsifying the driverkit root-cause theory and pointing at a
-  // readiness signal instead. Hypothesis: firing the first raw PTP BEFORE the
-  // device advertises this capability is what makes ICA hold it ~80s. So when
-  // `didOpenSessionWithError` fires before the capability is present, defer the
-  // warmup PTP until `cameraDeviceDidChangeCapability:` reports it. A fallback
-  // timer fires warmup anyway, so worst case == the pre-.k immediate behaviour.
-  private var warmupGatedDeviceId: String? = nil
-  private weak var warmupGatedCamera: ICCameraDevice? = nil
-  private var warmupGateOpenedAt: CFAbsoluteTime = 0
-  // ICCameraDevice capability string signalling the device is ready to accept
-  // raw PTP passthrough. Compared as a literal (the extern symbol may not be
-  // exported by the iOS ImageCaptureCore SDK we link against).
+  // `.l` — native-tether-first warmup. `.k` proved
+  // `ICCameraDeviceCanAcceptPTPCommands` is true from t≈0 (cold: @19ms,
+  // reconnect: @3ms) yet the first raw PTP still blocks ~35-50s, so that
+  // capability is NOT the readiness signal. Instead of firing our own raw PTP
+  // first (which forces ICA's slow generic USB bring-up), this build asks ICA
+  // to bring up its OWN Nikon tethering path via `requestEnableTethering` (the
+  // Z30 advertises it), waits for the native `tetheredCaptureEnabled` BOOL to
+  // flip true, and only THEN fires the raw warmup.
+  // ICCameraDevice capability string kept purely for open-time telemetry.
   private static let ptpReadyCapability = "ICCameraDeviceCanAcceptPTPCommands"
-  // If the capability never arrives, fire warmup anyway after this delay.
-  private static let warmupGateFallbackSeconds: Double = 8.0
+  private static let tetherEnableSelectorName = "requestEnableTethering"
+  private static let tetheredCaptureEnabledKey = "tetheredCaptureEnabled"
+  private static let tetherReadyPollIntervalSeconds: Double = 0.15
+  private static let tetherReadyDeadlineSeconds: Double = 90.0
+  private var tetherWaitStartedAt: CFAbsoluteTime = 0
 
   // The openSession watchdog. Kept as an instance constant so tests could
   // override it — currently only used by the default 120 s deadline.
@@ -1211,11 +1221,9 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       return
     }
 
-    // `.k` — log the capabilities the device advertises at open, then gate the
-    // warmup PTP on `ICCameraDeviceCanAcceptPTPCommands` (the constant 影控台
-    // Lite references). If it's already present, fire immediately (old path);
-    // otherwise wait for `cameraDeviceDidChangeCapability:` (fallback timer
-    // guarantees we never wait longer than the pre-.k behaviour + fallback).
+    // `.k` telemetry retained: capabilities at open (canAcceptPTP has proven
+    // always-true here, so it's a signpost, not a gate). `.l` then routes the
+    // warmup through ICA's native tethering bring-up before any raw PTP.
     let caps = cameraCapabilities(camera)
     let canPTP = caps.contains(Self.ptpReadyCapability)
     log(
@@ -1223,27 +1231,7 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       "deviceId=\(deviceId) canAcceptPTP=\(canPTP) caps=[\(caps.joined(separator: ","))]",
       elapsedMs: elapsedMs
     )
-    if canPTP {
-      fireWarmup(deviceId: deviceId, camera: camera)
-      return
-    }
-    warmupGatedDeviceId = deviceId
-    warmupGatedCamera = camera
-    warmupGateOpenedAt = CFAbsoluteTimeGetCurrent()
-    log(
-      "warmup.gated",
-      "deviceId=\(deviceId) waiting for canAcceptPTPCommands (fallback \(Self.warmupGateFallbackSeconds)s)")
-    icaPerform(after: Self.warmupGateFallbackSeconds) { [weak self] in
-      guard let self = self, self.warmupGatedDeviceId == deviceId else { return }
-      let waited = Int64(
-        (CFAbsoluteTimeGetCurrent() - self.warmupGateOpenedAt) * 1000)
-      self.log(
-        "warmup.gate.fallback",
-        "deviceId=\(deviceId) capability never arrived in \(waited)ms, firing warmup anyway",
-        error: true,
-        elapsedMs: waited)
-      self.releaseGatedWarmup(deviceId: deviceId)
-    }
+    beginTetherThenWarmup(deviceId: deviceId, camera: camera)
   }
 
   /// Read `ICCameraDevice.capabilities` defensively as `[String]` (the SDK
@@ -1254,15 +1242,94 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     return (camera.capabilities as [Any]).compactMap { $0 as? String }
   }
 
-  /// Fire the deferred warmup once the PTP-ready capability arrives (or the
-  /// fallback timer elapses). No-op if the gate was already released.
-  private func releaseGatedWarmup(deviceId: String) {
-    guard warmupGatedDeviceId == deviceId,
-      let camera = warmupGatedCamera
-    else { return }
-    warmupGatedDeviceId = nil
-    warmupGatedCamera = nil
-    fireWarmup(deviceId: deviceId, camera: camera)
+  /// `.l` — read the private `tetheredCaptureEnabled` BOOL via KVC (returns an
+  /// NSNumber; safe, unlike `perform()` on a BOOL-returning selector, which
+  /// mis-marshals the primitive return). `nil` when the device doesn't expose
+  /// it (older SDK / non-tethering camera).
+  private func nativeTetheredCaptureEnabled(_ camera: ICCameraDevice) -> Bool? {
+    guard
+      camera.responds(to: NSSelectorFromString(Self.tetheredCaptureEnabledKey))
+    else { return nil }
+    guard
+      let value = camera.value(forKey: Self.tetheredCaptureEnabledKey) as? NSNumber
+    else { return nil }
+    return value.boolValue
+  }
+
+  /// `.l` — issue ICA's native `requestEnableTethering` (void, no-arg — `perform`
+  /// marshals it safely). Returns false when the device doesn't advertise it.
+  @discardableResult
+  private func issueEnableTethering(_ camera: ICCameraDevice) -> Bool {
+    let sel = NSSelectorFromString(Self.tetherEnableSelectorName)
+    guard camera.responds(to: sel) else { return false }
+    _ = camera.perform(sel)
+    return true
+  }
+
+  /// `.l` — bring up the native Nikon tethering path, then fire the raw warmup
+  /// only once `tetheredCaptureEnabled` is true. Decomposes the first-command
+  /// tax: `tether.enable`→`tether.ready` measures native bring-up; the following
+  /// `warmup.done perSendMs` measures the raw send AFTER tethering is ready.
+  private func beginTetherThenWarmup(deviceId: String, camera: ICCameraDevice) {
+    let before = nativeTetheredCaptureEnabled(camera)
+    let issued = issueEnableTethering(camera)
+    tetherWaitStartedAt = CFAbsoluteTimeGetCurrent()
+    let beforeStr = before.map { $0 ? "true" : "false" } ?? "absent"
+    log(
+      "tether.enable",
+      "deviceId=\(deviceId) issued=\(issued) tetheredCaptureEnabledBefore=\(beforeStr)")
+    if before == true {
+      log("tether.ready",
+        "deviceId=\(deviceId) already enabled at open, firing warmup", elapsedMs: 0)
+      fireWarmup(deviceId: deviceId, camera: camera)
+      return
+    }
+    if !issued, before == nil {
+      log("tether.absent",
+        "deviceId=\(deviceId) no native tether API on this device, firing warmup immediately",
+        error: true)
+      fireWarmup(deviceId: deviceId, camera: camera)
+      return
+    }
+    pollTetherReady(deviceId: deviceId, camera: camera, attempt: 1)
+  }
+
+  /// `.l` — poll `tetheredCaptureEnabled` until true or the deadline, then fire
+  /// the raw warmup. Mirrors the busy-poll's stale-session guard
+  /// (`hasOpenSession` + `pendingOpenDeviceId`).
+  private func pollTetherReady(
+    deviceId: String, camera: ICCameraDevice, attempt: Int
+  ) {
+    guard camera.hasOpenSession, pendingOpenDeviceId == deviceId else {
+      log("tether.poll.abort",
+        "deviceId=\(deviceId) session no longer opening, dropping tether wait",
+        error: true)
+      return
+    }
+    let waited = Int64((CFAbsoluteTimeGetCurrent() - tetherWaitStartedAt) * 1000)
+    if nativeTetheredCaptureEnabled(camera) == true {
+      log("tether.ready",
+        "deviceId=\(deviceId) tetheredCaptureEnabled=true after \(waited)ms, firing warmup",
+        elapsedMs: waited)
+      fireWarmup(deviceId: deviceId, camera: camera)
+      return
+    }
+    if Double(waited) / 1000.0 >= Self.tetherReadyDeadlineSeconds {
+      log("tether.deadline",
+        "deviceId=\(deviceId) tetheredCaptureEnabled never true in \(waited)ms, firing warmup anyway",
+        error: true, elapsedMs: waited)
+      fireWarmup(deviceId: deviceId, camera: camera)
+      return
+    }
+    if Self.shouldLogPollAttempt(attempt) {
+      log("tether.poll",
+        "deviceId=\(deviceId) attempt=\(attempt) waitedMs=\(waited) tetheredCaptureEnabled=false",
+        elapsedMs: waited)
+    }
+    icaPerform(after: Self.tetherReadyPollIntervalSeconds) { [weak self] in
+      self?.pollTetherReady(
+        deviceId: deviceId, camera: camera, attempt: attempt + 1)
+    }
   }
 
   /// Fire the warmup `GetDeviceInfo` PTP command so Apple's ICA
@@ -1445,9 +1512,6 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       // Session is gone → warmup would have to re-run next open.
       warmupCompletedDeviceIds.remove(closedId)
     }
-    // `.k` — drop any pending warmup gate so it can't fire on a dead session.
-    warmupGatedDeviceId = nil
-    warmupGatedCamera = nil
     activeDevice = nil
     activeDeviceId = nil
     if let error = error {
@@ -1549,26 +1613,21 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
   ) {}
 
   func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {
-    // `.k` — the readiness signal 影控台 Lite gates on. Log the new capability
-    // set (+ how long after open it arrived) and, if a warmup is gated on the
-    // PTP-ready capability, release it now.
+    // Telemetry only (`.k` gate removed in `.l`): log the capability set, how
+    // long after open it changed, and the native `tetheredCaptureEnabled` state
+    // — which `.l`'s poll may be waiting to flip true.
     let caps = cameraCapabilities(camera)
     let canPTP = caps.contains(Self.ptpReadyCapability)
-    let waited = warmupGateOpenedAt == 0
+    let waited = pendingOpenStartedAt == 0
       ? Int64(-1)
-      : Int64((CFAbsoluteTimeGetCurrent() - warmupGateOpenedAt) * 1000)
-    let deviceId = warmupGatedDeviceId ?? activeDeviceId ?? idFor(camera)
+      : Int64((CFAbsoluteTimeGetCurrent() - pendingOpenStartedAt) * 1000)
+    let deviceId = activeDeviceId ?? idFor(camera)
+    let tethered = nativeTetheredCaptureEnabled(camera)
+      .map { $0 ? "true" : "false" } ?? "absent"
     log(
       "device.capability",
-      "deviceId=\(deviceId) canAcceptPTP=\(canPTP) waitedMs=\(waited) caps=[\(caps.joined(separator: ","))]",
+      "deviceId=\(deviceId) canAcceptPTP=\(canPTP) tethered=\(tethered) waitedMs=\(waited) caps=[\(caps.joined(separator: ","))]",
       elapsedMs: waited)
-    if canPTP, let gated = warmupGatedDeviceId {
-      log(
-        "warmup.gate.release",
-        "deviceId=\(gated) capability arrived after \(waited)ms",
-        elapsedMs: waited)
-      releaseGatedWarmup(deviceId: gated)
-    }
   }
 
   func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice)
