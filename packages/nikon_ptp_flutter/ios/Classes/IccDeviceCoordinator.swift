@@ -86,7 +86,19 @@ final class IccDeviceCoordinator: NSObject {
   ///                  and marshals every pigeon call (flutterApi + completions)
   ///                  back to main. Hypothesis: an unstarved ICA runloop lets its
   ///                  first-command USB servicing complete in Cascable-like time.
-  private static let iccBuildTag: String = "2026-08-20.j"
+  ///                  RESULT: perSendMs=78735 on a private live-runloop thread —
+  ///                  threading is NOT the gap; hold is inside the first send.
+  ///   2026-08-21.k — RE of a 2nd fast app (影控台 Lite / ZControlLite 1.4.2)
+  ///                  FALSIFIES the driverkit theory: it carries NO driverkit
+  ///                  entitlement yet connects in seconds. Its binary references
+  ///                  the ICA capability constant `ICCameraDeviceCanAcceptPTP-
+  ///                  Commands`. So this build GATES the first warmup PTP on that
+  ///                  capability appearing in `camera.capabilities` (via
+  ///                  cameraDeviceDidChangeCapability:) instead of firing raw PTP
+  ///                  immediately on didOpen. Rich caps telemetry + 8s fallback so
+  ///                  worst case == pre-.k. Tests: does ICA advertise PTP-ready
+  ///                  EARLY (→ first command lands fast) or only after the ~80s?
+  private static let iccBuildTag: String = "2026-08-21.k"
 
   // Warmup -21249 retry probe (Phase P0). If the first `requestSendPTPCommand`
   // (warmup GetDeviceInfo) is rejected with ICReturnPTPNotAuthorizedToSendCommand
@@ -241,6 +253,25 @@ final class IccDeviceCoordinator: NSObject {
   private var eagerPreOpenEnabled: Bool = false
   private var warmupCompletedDeviceIds: Set<String> = []
   private var warmupInProgress: Bool = false
+
+  // `.k` — capability-gated warmup. RE of a SECOND fast-connecting app
+  // (影控台 Lite / ZControlLite 1.4.2) found it references the ICA capability
+  // constant `ICCameraDeviceCanAcceptPTPCommands` and carries NO driverkit
+  // entitlement — falsifying the driverkit root-cause theory and pointing at a
+  // readiness signal instead. Hypothesis: firing the first raw PTP BEFORE the
+  // device advertises this capability is what makes ICA hold it ~80s. So when
+  // `didOpenSessionWithError` fires before the capability is present, defer the
+  // warmup PTP until `cameraDeviceDidChangeCapability:` reports it. A fallback
+  // timer fires warmup anyway, so worst case == the pre-.k immediate behaviour.
+  private var warmupGatedDeviceId: String? = nil
+  private weak var warmupGatedCamera: ICCameraDevice? = nil
+  private var warmupGateOpenedAt: CFAbsoluteTime = 0
+  // ICCameraDevice capability string signalling the device is ready to accept
+  // raw PTP passthrough. Compared as a literal (the extern symbol may not be
+  // exported by the iOS ImageCaptureCore SDK we link against).
+  private static let ptpReadyCapability = "ICCameraDeviceCanAcceptPTPCommands"
+  // If the capability never arrives, fire warmup anyway after this delay.
+  private static let warmupGateFallbackSeconds: Double = 8.0
 
   // The openSession watchdog. Kept as an instance constant so tests could
   // override it — currently only used by the default 120 s deadline.
@@ -1179,6 +1210,58 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       for c in comps { c(.success(true)) }
       return
     }
+
+    // `.k` — log the capabilities the device advertises at open, then gate the
+    // warmup PTP on `ICCameraDeviceCanAcceptPTPCommands` (the constant 影控台
+    // Lite references). If it's already present, fire immediately (old path);
+    // otherwise wait for `cameraDeviceDidChangeCapability:` (fallback timer
+    // guarantees we never wait longer than the pre-.k behaviour + fallback).
+    let caps = cameraCapabilities(camera)
+    let canPTP = caps.contains(Self.ptpReadyCapability)
+    log(
+      "openSession.caps",
+      "deviceId=\(deviceId) canAcceptPTP=\(canPTP) caps=[\(caps.joined(separator: ","))]",
+      elapsedMs: elapsedMs
+    )
+    if canPTP {
+      fireWarmup(deviceId: deviceId, camera: camera)
+      return
+    }
+    warmupGatedDeviceId = deviceId
+    warmupGatedCamera = camera
+    warmupGateOpenedAt = CFAbsoluteTimeGetCurrent()
+    log(
+      "warmup.gated",
+      "deviceId=\(deviceId) waiting for canAcceptPTPCommands (fallback \(Self.warmupGateFallbackSeconds)s)")
+    icaPerform(after: Self.warmupGateFallbackSeconds) { [weak self] in
+      guard let self = self, self.warmupGatedDeviceId == deviceId else { return }
+      let waited = Int64(
+        (CFAbsoluteTimeGetCurrent() - self.warmupGateOpenedAt) * 1000)
+      self.log(
+        "warmup.gate.fallback",
+        "deviceId=\(deviceId) capability never arrived in \(waited)ms, firing warmup anyway",
+        error: true,
+        elapsedMs: waited)
+      self.releaseGatedWarmup(deviceId: deviceId)
+    }
+  }
+
+  /// Read `ICCameraDevice.capabilities` defensively as `[String]` (the SDK
+  /// types it as `[Any]`/NSString on some platforms).
+  private func cameraCapabilities(_ camera: ICCameraDevice) -> [String] {
+    // Upcast through `[Any]` first so the element cast is a real conditional
+    // cast on every SDK typing (`[String]` or `[Any]`) — no always-succeeds warn.
+    return (camera.capabilities as [Any]).compactMap { $0 as? String }
+  }
+
+  /// Fire the deferred warmup once the PTP-ready capability arrives (or the
+  /// fallback timer elapses). No-op if the gate was already released.
+  private func releaseGatedWarmup(deviceId: String) {
+    guard warmupGatedDeviceId == deviceId,
+      let camera = warmupGatedCamera
+    else { return }
+    warmupGatedDeviceId = nil
+    warmupGatedCamera = nil
     fireWarmup(deviceId: deviceId, camera: camera)
   }
 
@@ -1362,6 +1445,9 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
       // Session is gone → warmup would have to re-run next open.
       warmupCompletedDeviceIds.remove(closedId)
     }
+    // `.k` — drop any pending warmup gate so it can't fire on a dead session.
+    warmupGatedDeviceId = nil
+    warmupGatedCamera = nil
     activeDevice = nil
     activeDeviceId = nil
     if let error = error {
@@ -1462,7 +1548,28 @@ extension IccDeviceCoordinator: ICCameraDeviceDelegate {
     didRenameItems items: [ICCameraItem]
   ) {}
 
-  func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
+  func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {
+    // `.k` — the readiness signal 影控台 Lite gates on. Log the new capability
+    // set (+ how long after open it arrived) and, if a warmup is gated on the
+    // PTP-ready capability, release it now.
+    let caps = cameraCapabilities(camera)
+    let canPTP = caps.contains(Self.ptpReadyCapability)
+    let waited = warmupGateOpenedAt == 0
+      ? Int64(-1)
+      : Int64((CFAbsoluteTimeGetCurrent() - warmupGateOpenedAt) * 1000)
+    let deviceId = warmupGatedDeviceId ?? activeDeviceId ?? idFor(camera)
+    log(
+      "device.capability",
+      "deviceId=\(deviceId) canAcceptPTP=\(canPTP) waitedMs=\(waited) caps=[\(caps.joined(separator: ","))]",
+      elapsedMs: waited)
+    if canPTP, let gated = warmupGatedDeviceId {
+      log(
+        "warmup.gate.release",
+        "deviceId=\(gated) capability arrived after \(waited)ms",
+        elapsedMs: waited)
+      releaseGatedWarmup(deviceId: gated)
+    }
+  }
 
   func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice)
   {
